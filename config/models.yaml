@@ -1,0 +1,90 @@
+# vast-comfy model & plugin manifest (SPEC.md section 11).
+#
+# Pinned revisions + sha256 for every file. Models are downloaded DIRECTLY by
+# the instance (never relayed through the control machine). Adding files here
+# is an explicit user action; the initial install only contains the entries
+# below.
+#
+# sources:
+#   type: huggingface  -> repo / revision (commit sha) / path
+#   type: civitai      -> version_id (+ optional auth_env: CIVITAI_TOKEN)
+# `auth_env` names an environment variable that must already exist on the
+# instance (controller passes it only with explicit approval).
+
+schema_version: 1
+
+models:
+  - id: anima-base-v1.0
+    purpose: "Anima-Base v1.0: base text-to-image and LLLite control verification"
+    source:
+      type: huggingface
+      repo: circlestone-labs/Anima
+      revision: f973fc41ec7545364ac9776c2440285f43ff2a30
+      path: split_files/diffusion_models/anima-base-v1.0.safetensors
+    dest: diffusion_models/anima-base-v1.0.safetensors
+    sha256: bd43b7cffe1ed1153d9c41e7beb2f18cb1273eafbaa3af3edd6a173dc90a006e
+    size_bytes: 4182218328
+
+  - id: anima-turbo-v1.1
+    purpose: "Anima-Turbo v1.1: fast text-to-image (full checkpoint, not a LoRA)"
+    source:
+      type: huggingface
+      repo: circlestone-labs/Anima
+      revision: f973fc41ec7545364ac9776c2440285f43ff2a30
+      path: split_files/diffusion_models/anima-turbo-v1.1.safetensors
+    dest: diffusion_models/anima-turbo-v1.1.safetensors
+    sha256: fba11953276b57edf59d1dc4f1857ac05aa079c56f982b4d7c20298d57d3f7eb
+    size_bytes: 4182230656
+
+  - id: qwen-3-0.6b-text-encoder
+    purpose: "Qwen3-0.6B text encoder required by Anima"
+    source:
+      type: huggingface
+      repo: circlestone-labs/Anima
+      revision: f973fc41ec7545364ac9776c2440285f43ff2a30
+      path: split_files/text_encoders/qwen_3_06b_base.safetensors
+    dest: text_encoders/qwen_3_06b_base.safetensors
+    sha256: cd2a512003e2f9f3cd3c32a9c3573f820bb28c940f73c57b1ddaa983d9223eba
+    size_bytes: 1192135096
+
+  - id: qwen-image-vae
+    purpose: "Qwen-Image VAE required by Anima"
+    source:
+      type: huggingface
+      repo: circlestone-labs/Anima
+      revision: f973fc41ec7545364ac9776c2440285f43ff2a30
+      path: split_files/vae/qwen_image_vae.safetensors
+    dest: vae/qwen_image_vae.safetensors
+    sha256: a70580f0213e67967ee9c95f05bb400e8fb08307e017a924bf3441223e023d1f
+    size_bytes: 253806246
+
+  - id: anima-lllite-any-test-like-v2
+    purpose: "Anima-LLLite v2 mixed lineart/scribble/grayscale control weights"
+    source:
+      type: huggingface
+      repo: kohya-ss/Anima-LLLite
+      revision: 36ba7f2f498a1ca63cc77fc7a1298652f72d4524
+      path: anima-lllite-any-test-like-v2.safetensors
+    dest: controlnet/anima-lllite-any-test-like-v2.safetensors
+    sha256: 8863424f04a2445815a827b22cbda557a085d2752e05fab54a2b303821a9e3b2
+    size_bytes: 16403008
+
+  - id: anima-lllite-inpainting-v2
+    purpose: "Anima-LLLite v2 inpainting weights (requires an RGB image + mask)"
+    source:
+      type: huggingface
+      repo: kohya-ss/Anima-LLLite
+      revision: 36ba7f2f498a1ca63cc77fc7a1298652f72d4524
+      path: anima-lllite-inpainting-v2.safetensors
+    dest: controlnet/anima-lllite-inpainting-v2.safetensors
+    sha256: 5242e677d2be34ee70ca7c97c3b14ff5ee49838c03fc1e60ac4852a180db6ef5
+    size_bytes: 65772872
+
+plugins:
+  - id: comfyui-anima-lllite
+    purpose: "sd-scripts Anima-LLLite node (AnimaLLLiteApply_sdscripts)"
+    repo_url: https://github.com/kohya-ss/ComfyUI-Anima-LLLite
+    commit: b7495bd8eb876e334509976896702484ed19cdbb
+    dest: custom_nodes/ComfyUI-Anima-LLLite
+    required_nodes:
+      - AnimaLLLiteApply_sdscripts

@@ -1,0 +1,44 @@
+schema_version: 1
+cases:
+  - id: base_t2i
+    title: "Anima-Base text to image"
+    workflow: anima_base_t2i.api.json
+    timeout_minutes: 15
+    inputs: []
+    overrides:
+      "6": {seed: "$run_seed"}
+    expect:
+      width: 1024
+      height: 1024
+  - id: lllite_lineart
+    title: "Anima-Base + LLLite mixed line-art control"
+    workflow: anima_base_lllite_lineart.api.json
+    timeout_minutes: 15
+    inputs:
+      - vast_comfy_smoke_control.png
+    overrides:
+      "6": {seed: "$run_seed"}
+    expect:
+      width: 1024
+      height: 1024
+  - id: lllite_inpaint
+    title: "Anima-Base + LLLite inpainting"
+    workflow: anima_base_lllite_inpaint.api.json
+    timeout_minutes: 15
+    inputs:
+      - vast_comfy_smoke_inpaint_src.png
+    overrides:
+      "6": {seed: "$run_seed"}
+    expect:
+      width: 1024
+      height: 1024
+  - id: turbo_t2i
+    title: "Anima-Turbo text to image"
+    workflow: anima_turbo_t2i.api.json
+    timeout_minutes: 15
+    inputs: []
+    overrides:
+      "6": {seed: "$run_seed"}
+    expect:
+      width: 1024
+      height: 1024

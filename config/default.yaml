@@ -1,0 +1,108 @@
+# vast-comfy built-in defaults (SPEC.md).
+# Precedence: built-in defaults -> this YAML (--config) -> explicit CLI options.
+# This file doubles as the reference copy of the built-in defaults: keep it in
+# sync with vast_comfy.config.DEFAULTS (enforced by a unit test).
+
+version: 1
+
+vast:
+  api_base_url: "https://console.vast.ai"
+  api_key_env: "VAST_API_KEY"
+  request_timeout_seconds: 30
+  transient_retries: 3
+  retry_backoff_seconds: [1, 3, 8]
+
+gpu:
+  alias: null                 # required for offer search / rental, e.g. "rtx_4090"
+  count: 1
+  compute_cap_min: 750
+  cuda_max_good_min: 12.9
+  gpu_arch: "nvidia"
+  cpu_arch: "amd64"
+  vram_gb_min: null           # optional extra VRAM floor on top of the alias
+
+image:
+  repository: "vastai/comfy"
+  tag: "v0.40.0-cuda-12.9-py312"   # fixed; "latest" is rejected
+  amd64_digest: "sha256:63ece702ee45b0b6748b28046b65005340eae4fa48db3bdba664cca1dacb948a"
+  comfyui_dir: "/workspace/ComfyUI"
+  venv_python: "/venv/main/bin/python"
+  supervisor_service: "comfyui"
+  internal_port: 18188
+  comfy_external_port: 8188
+  portal_external_port: 1111
+  runtime_dir: "/workspace/.vast_comfy"
+  comfyui_args: "--disable-auto-launch --enable-cors-header --port 18188"
+
+storage:
+  disk_gb: 300
+
+network:
+  # Platform-reported values compared with the same numeric contract the
+  # official Vast.ai ComfyUI template uses (inet_down gte 500). See SPEC.md 5.2.
+  inet_down_min: 500
+  inet_up_min: 500
+  unit_contract: "mbps_platform_reported"
+
+host:
+  verified: true
+  reliability_min: 0.99
+  cpu_cores_effective_min: 4
+  cpu_ram_gb_min: 16
+  geolocation_allow: []
+  geolocation_exclude: []
+  external: false
+  rentable: true
+
+offers:
+  result_limit: 100
+
+pricing:
+  rental_type: "ondemand"
+  max_dph_total_usd_per_hour: 2.0
+
+ssh:
+  strategy: "proxy_only"      # v1: only proxy_only is implemented
+  user: "root"
+  key_path: null              # e.g. "~/.ssh/id_rsa" (private key, stays local)
+  known_hosts_path: null      # default: <paths.root>/known_hosts
+  connect_timeout_seconds: 15
+  command_timeout_seconds: 120
+  server_alive_interval_seconds: 20
+  server_alive_count_max: 3
+  scp_timeout_seconds: 3600
+
+launch:
+  start_wait_minutes: 45
+  ssh_ready_wait_minutes: 10
+  poll_interval_seconds: 10
+
+lock:
+  heartbeat_seconds: 30
+  heartbeat_ttl_seconds: 300
+  heartbeat_buffer_seconds: 60
+
+jobs:
+  install_timeout_minutes: 90
+  smoke_case_timeout_minutes: 15
+  wait_poll_seconds: 10
+  log_tail_lines: 200
+
+comfy:
+  health_timeout_seconds: 180
+  restart_wait_seconds: 240
+
+smoke:
+  seed: 12345
+  unique_seed_per_run: true   # per-run unique seed defeats ComfyUI node caching
+
+session:
+  release_on_success: true    # combined flows release the lock when they succeed
+
+paths:
+  root: null                  # default: ~/.vast_comfy
+  state_dir: null             # default: <root>/state
+  logs_dir: null              # default: <root>/logs
+
+download:
+  default_dest: null

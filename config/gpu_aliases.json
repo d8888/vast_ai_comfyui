@@ -1,0 +1,470 @@
+{
+  "aliases": {
+    "a10": {
+      "gpu_name": "A10"
+    },
+    "a100_pcie": {
+      "gpu_name": "A100 PCIE"
+    },
+    "a100_sxm4": {
+      "gpu_name": "A100 SXM4"
+    },
+    "a16": {
+      "gpu_name": "A16"
+    },
+    "a30": {
+      "gpu_name": "A30"
+    },
+    "a40": {
+      "gpu_name": "A40"
+    },
+    "a800_pcie": {
+      "gpu_name": "A800 PCIE"
+    },
+    "b200": {
+      "gpu_name": "B200"
+    },
+    "b300": {
+      "gpu_name": "B300"
+    },
+    "b300_pc": {
+      "gpu_name": "B300 PC"
+    },
+    "cmp_170hx": {
+      "gpu_name": "CMP 170HX"
+    },
+    "gb10": {
+      "gpu_name": "GB10"
+    },
+    "gb300": {
+      "gpu_name": "GB300"
+    },
+    "gh200_sxm": {
+      "gpu_name": "GH200 SXM"
+    },
+    "gtx_1050_ti": {
+      "gpu_name": "GTX 1050 Ti"
+    },
+    "gtx_1060": {
+      "gpu_name": "GTX 1060"
+    },
+    "gtx_1070": {
+      "gpu_name": "GTX 1070"
+    },
+    "gtx_1070_ti": {
+      "gpu_name": "GTX 1070 Ti"
+    },
+    "gtx_1080": {
+      "gpu_name": "GTX 1080"
+    },
+    "gtx_1080_ti": {
+      "gpu_name": "GTX 1080 Ti"
+    },
+    "gtx_1650": {
+      "gpu_name": "GTX 1650"
+    },
+    "gtx_1650_s": {
+      "gpu_name": "GTX 1650 S"
+    },
+    "gtx_1660": {
+      "gpu_name": "GTX 1660"
+    },
+    "gtx_1660_s": {
+      "gpu_name": "GTX 1660 S"
+    },
+    "gtx_1660_ti": {
+      "gpu_name": "GTX 1660 Ti"
+    },
+    "gtx_titan_x": {
+      "gpu_name": "GTX TITAN X"
+    },
+    "h100_nvl": {
+      "gpu_name": "H100 NVL"
+    },
+    "h100_pcie": {
+      "gpu_name": "H100 PCIE"
+    },
+    "h100_sxm": {
+      "gpu_name": "H100 SXM"
+    },
+    "h200": {
+      "gpu_name": "H200"
+    },
+    "h200_nvl": {
+      "gpu_name": "H200 NVL"
+    },
+    "instinctmi100": {
+      "gpu_name": "InstinctMI100"
+    },
+    "l4": {
+      "gpu_name": "L4"
+    },
+    "l40": {
+      "gpu_name": "L40"
+    },
+    "l40s": {
+      "gpu_name": "L40S"
+    },
+    "q_rtx_4000": {
+      "gpu_name": "Q RTX 4000"
+    },
+    "q_rtx_5000": {
+      "gpu_name": "Q RTX 5000"
+    },
+    "q_rtx_6000": {
+      "gpu_name": "Q RTX 6000"
+    },
+    "q_rtx_8000": {
+      "gpu_name": "Q RTX 8000"
+    },
+    "quadro_gv100": {
+      "gpu_name": "Quadro GV100"
+    },
+    "quadro_k2200": {
+      "gpu_name": "Quadro K2200"
+    },
+    "quadro_p2000": {
+      "gpu_name": "Quadro P2000"
+    },
+    "quadro_p4000": {
+      "gpu_name": "Quadro P4000"
+    },
+    "rtx_2060": {
+      "gpu_name": "RTX 2060"
+    },
+    "rtx_2060s": {
+      "gpu_name": "RTX 2060S"
+    },
+    "rtx_2070": {
+      "gpu_name": "RTX 2070"
+    },
+    "rtx_2070s": {
+      "gpu_name": "RTX 2070S"
+    },
+    "rtx_2080": {
+      "gpu_name": "RTX 2080"
+    },
+    "rtx_2080_ti": {
+      "gpu_name": "RTX 2080 Ti"
+    },
+    "rtx_3050": {
+      "gpu_name": "RTX 3050"
+    },
+    "rtx_3060": {
+      "gpu_name": "RTX 3060"
+    },
+    "rtx_3060_12gb": {
+      "gpu_name": "RTX 3060",
+      "gpu_ram_mb_max": 12600,
+      "gpu_ram_mb_min": 11500
+    },
+    "rtx_3060_8gb": {
+      "gpu_name": "RTX 3060",
+      "gpu_ram_mb_max": 8600,
+      "gpu_ram_mb_min": 7500
+    },
+    "rtx_3060_laptop": {
+      "gpu_name": "RTX 3060 laptop"
+    },
+    "rtx_3060_ti": {
+      "gpu_name": "RTX 3060 Ti"
+    },
+    "rtx_3070": {
+      "gpu_name": "RTX 3070"
+    },
+    "rtx_3070_laptop": {
+      "gpu_name": "RTX 3070 laptop"
+    },
+    "rtx_3070_ti": {
+      "gpu_name": "RTX 3070 Ti"
+    },
+    "rtx_3080": {
+      "gpu_name": "RTX 3080"
+    },
+    "rtx_3080_10gb": {
+      "gpu_name": "RTX 3080",
+      "gpu_ram_mb_max": 10600,
+      "gpu_ram_mb_min": 9500
+    },
+    "rtx_3080_12gb": {
+      "gpu_name": "RTX 3080",
+      "gpu_ram_mb_max": 12600,
+      "gpu_ram_mb_min": 11500
+    },
+    "rtx_3080_ti": {
+      "gpu_name": "RTX 3080 Ti"
+    },
+    "rtx_3090": {
+      "gpu_name": "RTX 3090"
+    },
+    "rtx_3090_ti": {
+      "gpu_name": "RTX 3090 Ti"
+    },
+    "rtx_4000ada": {
+      "gpu_name": "RTX 4000Ada"
+    },
+    "rtx_4060": {
+      "gpu_name": "RTX 4060"
+    },
+    "rtx_4060_laptop": {
+      "gpu_name": "RTX 4060 laptop"
+    },
+    "rtx_4060_ti": {
+      "gpu_name": "RTX 4060 Ti"
+    },
+    "rtx_4060_ti_16gb": {
+      "gpu_name": "RTX 4060 Ti",
+      "gpu_ram_mb_max": 17000,
+      "gpu_ram_mb_min": 15500
+    },
+    "rtx_4060_ti_8gb": {
+      "gpu_name": "RTX 4060 Ti",
+      "gpu_ram_mb_max": 8600,
+      "gpu_ram_mb_min": 7500
+    },
+    "rtx_4070": {
+      "gpu_name": "RTX 4070"
+    },
+    "rtx_4070_laptop": {
+      "gpu_name": "RTX 4070 laptop"
+    },
+    "rtx_4070_ti": {
+      "gpu_name": "RTX 4070 Ti"
+    },
+    "rtx_4070s": {
+      "gpu_name": "RTX 4070S"
+    },
+    "rtx_4070s_ti": {
+      "gpu_name": "RTX 4070S Ti"
+    },
+    "rtx_4080": {
+      "gpu_name": "RTX 4080"
+    },
+    "rtx_4080_laptop": {
+      "gpu_name": "RTX 4080 laptop"
+    },
+    "rtx_4080s": {
+      "gpu_name": "RTX 4080S"
+    },
+    "rtx_4090": {
+      "gpu_name": "RTX 4090"
+    },
+    "rtx_4090d": {
+      "gpu_name": "RTX 4090D"
+    },
+    "rtx_4500ada": {
+      "gpu_name": "RTX 4500Ada"
+    },
+    "rtx_5000ada": {
+      "gpu_name": "RTX 5000Ada"
+    },
+    "rtx_5060": {
+      "gpu_name": "RTX 5060"
+    },
+    "rtx_5060_ti": {
+      "gpu_name": "RTX 5060 Ti"
+    },
+    "rtx_5060_ti_16gb": {
+      "gpu_name": "RTX 5060 Ti",
+      "gpu_ram_mb_max": 17000,
+      "gpu_ram_mb_min": 15500
+    },
+    "rtx_5060_ti_8gb": {
+      "gpu_name": "RTX 5060 Ti",
+      "gpu_ram_mb_max": 8600,
+      "gpu_ram_mb_min": 7500
+    },
+    "rtx_5070": {
+      "gpu_name": "RTX 5070"
+    },
+    "rtx_5070_ti": {
+      "gpu_name": "RTX 5070 Ti"
+    },
+    "rtx_5080": {
+      "gpu_name": "RTX 5080"
+    },
+    "rtx_5090": {
+      "gpu_name": "RTX 5090"
+    },
+    "rtx_5090d": {
+      "gpu_name": "RTX 5090D"
+    },
+    "rtx_5880ada": {
+      "gpu_name": "RTX 5880Ada"
+    },
+    "rtx_6000ada": {
+      "gpu_name": "RTX 6000Ada"
+    },
+    "rtx_6000d": {
+      "gpu_name": "RTX 6000D"
+    },
+    "rtx_a2000": {
+      "gpu_name": "RTX A2000"
+    },
+    "rtx_a4000": {
+      "gpu_name": "RTX A4000"
+    },
+    "rtx_a4500": {
+      "gpu_name": "RTX A4500"
+    },
+    "rtx_a5000": {
+      "gpu_name": "RTX A5000"
+    },
+    "rtx_a6000": {
+      "gpu_name": "RTX A6000"
+    },
+    "rtx_pro_4000": {
+      "gpu_name": "RTX PRO 4000"
+    },
+    "rtx_pro_4500": {
+      "gpu_name": "RTX PRO 4500"
+    },
+    "rtx_pro_5000": {
+      "gpu_name": "RTX PRO 5000"
+    },
+    "rtx_pro_6000_max_q": {
+      "gpu_name": "RTX PRO 6000 Max-Q"
+    },
+    "rtx_pro_6000_s": {
+      "gpu_name": "RTX PRO 6000 S"
+    },
+    "rtx_pro_6000_ws": {
+      "gpu_name": "RTX PRO 6000 WS"
+    },
+    "tesla_p100": {
+      "gpu_name": "Tesla P100"
+    },
+    "tesla_p4": {
+      "gpu_name": "Tesla P4"
+    },
+    "tesla_p40": {
+      "gpu_name": "Tesla P40"
+    },
+    "tesla_t4": {
+      "gpu_name": "Tesla T4"
+    },
+    "tesla_v100": {
+      "gpu_name": "Tesla V100"
+    },
+    "titan_rtx": {
+      "gpu_name": "Titan RTX"
+    },
+    "titan_v": {
+      "gpu_name": "Titan V"
+    },
+    "titan_xp": {
+      "gpu_name": "Titan Xp"
+    }
+  },
+  "custom": {},
+  "fetched_at_utc": "2026-10-15T10:27:04Z",
+  "official_names": [
+    "A10",
+    "A100 PCIE",
+    "A100 SXM4",
+    "A16",
+    "A30",
+    "A40",
+    "A800 PCIE",
+    "B200",
+    "B300",
+    "B300 PC",
+    "CMP 170HX",
+    "GB10",
+    "GB300",
+    "GH200 SXM",
+    "GTX 1050 Ti",
+    "GTX 1060",
+    "GTX 1070",
+    "GTX 1070 Ti",
+    "GTX 1080",
+    "GTX 1080 Ti",
+    "GTX 1650",
+    "GTX 1650 S",
+    "GTX 1660",
+    "GTX 1660 S",
+    "GTX 1660 Ti",
+    "GTX TITAN X",
+    "H100 NVL",
+    "H100 PCIE",
+    "H100 SXM",
+    "H200",
+    "H200 NVL",
+    "InstinctMI100",
+    "L4",
+    "L40",
+    "L40S",
+    "Q RTX 4000",
+    "Q RTX 5000",
+    "Q RTX 6000",
+    "Q RTX 8000",
+    "Quadro GV100",
+    "Quadro K2200",
+    "Quadro P2000",
+    "Quadro P4000",
+    "RTX 2060",
+    "RTX 2060S",
+    "RTX 2070",
+    "RTX 2070S",
+    "RTX 2080",
+    "RTX 2080 Ti",
+    "RTX 3050",
+    "RTX 3060",
+    "RTX 3060 Ti",
+    "RTX 3060 laptop",
+    "RTX 3070",
+    "RTX 3070 Ti",
+    "RTX 3070 laptop",
+    "RTX 3080",
+    "RTX 3080 Ti",
+    "RTX 3090",
+    "RTX 3090 Ti",
+    "RTX 4000Ada",
+    "RTX 4060",
+    "RTX 4060 Ti",
+    "RTX 4060 laptop",
+    "RTX 4070",
+    "RTX 4070 Ti",
+    "RTX 4070 laptop",
+    "RTX 4070S",
+    "RTX 4070S Ti",
+    "RTX 4080",
+    "RTX 4080 laptop",
+    "RTX 4080S",
+    "RTX 4090",
+    "RTX 4090D",
+    "RTX 4500Ada",
+    "RTX 5000Ada",
+    "RTX 5060",
+    "RTX 5060 Ti",
+    "RTX 5070",
+    "RTX 5070 Ti",
+    "RTX 5080",
+    "RTX 5090",
+    "RTX 5090D",
+    "RTX 5880Ada",
+    "RTX 6000Ada",
+    "RTX 6000D",
+    "RTX A2000",
+    "RTX A4000",
+    "RTX A4500",
+    "RTX A5000",
+    "RTX A6000",
+    "RTX PRO 4000",
+    "RTX PRO 4500",
+    "RTX PRO 5000",
+    "RTX PRO 6000 Max-Q",
+    "RTX PRO 6000 S",
+    "RTX PRO 6000 WS",
+    "Tesla P100",
+    "Tesla P4",
+    "Tesla P40",
+    "Tesla T4",
+    "Tesla V100",
+    "Titan RTX",
+    "Titan V",
+    "Titan Xp"
+  ],
+  "schema_version": 1,
+  "source": "https://console.vast.ai/api/v0/gpu_names/unique/"
+}

@@ -86,6 +86,7 @@ class StateStore:
     def record_session(self, session_id: str, **fields: Any) -> None:
         existing = self.get("sessions", session_id) or {}
         existing.update(fields)
+        existing["session_id"] = str(session_id)
         self.put("sessions", session_id, existing)
 
     def get_session(self, session_id: str) -> dict[str, Any] | None:

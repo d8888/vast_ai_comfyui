@@ -49,6 +49,7 @@ def run_smoke(
         str(instance_id),
         "--image-ref",
         f"{cfg.require('image.repository')}:{cfg.require('image.tag')}",
+        "--comfy-url", f"http://localhost:{cfg.require('image.internal_port')}",
     ]
     if cases:
         argv += ["--cases", cases]

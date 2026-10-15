@@ -16,6 +16,13 @@ from vast_comfy.vast.rental import (
 )
 
 
+@pytest.fixture(autouse=True)
+def isolate_local_key_preflight(monkeypatch):
+    # This module tests request outcomes; the real local-key preflight rejection
+    # is exercised separately in test_audit_safety_regressions (zero paid calls).
+    monkeypatch.setattr("vast_comfy.vast.rental.rental_preflight", lambda *_: {})
+
+
 class StubClient:
     """Minimal VastClient stand-in that records calls."""
 

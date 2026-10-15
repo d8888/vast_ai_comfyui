@@ -137,9 +137,9 @@ def _runner(cfg: Config, instance_id: int | str, client: VastClient | None = Non
     return load_runner(client or make_client(cfg), cfg, instance_id)
 
 
-def deploy_package(cfg: Config, instance_id: int | str, *, client: VastClient | None = None) -> dict:
+def deploy_package(cfg: Config, instance_id: int | str, *, session_id: str, client: VastClient | None = None) -> dict:
     _, runner = _runner(cfg, instance_id, client)
-    return _remote.deploy_package(runner, cfg)
+    return _remote.deploy_package(runner, cfg, session_id=session_id)
 
 
 def prepare_existing(
@@ -179,20 +179,19 @@ def smoke_run(
     return _smoke.run_smoke(runner, cfg, session_id=session_id, instance_id=instance_id, cases=cases, run_id=run_id)
 
 
-def show_report(cfg: Config, instance_id: int | str, run_id: str, *, client: VastClient | None = None) -> dict:
+def show_report(cfg: Config, instance_id: int | str, run_id: str, *, session_id: str, client: VastClient | None = None) -> dict:
     _, runner = _runner(cfg, instance_id, client)
-    return _smoke.show_report(runner, cfg, run_id)
+    with _locks.operation(runner, cfg, session_id, label="report"):
+        return _smoke.show_report(runner, cfg, run_id)
 
 
 def session_acquire(cfg: Config, instance_id: int | str, *, session_id: str | None = None, client: VastClient | None = None) -> dict:
     _, runner = _runner(cfg, instance_id, client)
-    _remote.deploy_package(runner, cfg)
     return _locks.acquire(runner, cfg, instance_id, session_id=session_id)
 
 
 def session_status(cfg: Config, instance_id: int | str, *, session_id: str | None = None, client: VastClient | None = None) -> dict:
     _, runner = _runner(cfg, instance_id, client)
-    _remote.deploy_package(runner, cfg)
     return _locks.status(runner, cfg, session_id=session_id)
 
 
@@ -203,7 +202,6 @@ def session_release(cfg: Config, instance_id: int | str, session_id: str, *, cli
 
 def session_recover(cfg: Config, instance_id: int | str, *, session_id: str | None = None, client: VastClient | None = None) -> dict:
     _, runner = _runner(cfg, instance_id, client)
-    _remote.deploy_package(runner, cfg)
     return _locks.recover(runner, cfg, instance_id, session_id=session_id)
 
 
@@ -239,14 +237,16 @@ def wait_instance_ready(cfg: Config, instance_id: int | str, *, client: VastClie
 # ---------------------------------------------------------------------------
 
 
-def download_report(cfg: Config, instance_id: int | str, run_id: str, dest: Path | str, *, overwrite: bool = False, client: VastClient | None = None) -> dict:
+def download_report(cfg: Config, instance_id: int | str, run_id: str, dest: Path | str, *, session_id: str, overwrite: bool = False, client: VastClient | None = None) -> dict:
     _, runner = _runner(cfg, instance_id, client)
-    return _download.download_report(runner, cfg, run_id=run_id, dest_dir=dest, overwrite=overwrite)
+    with _locks.operation(runner, cfg, session_id, label="download"):
+        return _download.download_report(runner, cfg, run_id=run_id, dest_dir=dest, overwrite=overwrite)
 
 
-def download_smoke_images(cfg: Config, instance_id: int | str, run_id: str, dest: Path | str, *, overwrite: bool = False, client: VastClient | None = None) -> dict:
+def download_smoke_images(cfg: Config, instance_id: int | str, run_id: str, dest: Path | str, *, session_id: str, overwrite: bool = False, client: VastClient | None = None) -> dict:
     _, runner = _runner(cfg, instance_id, client)
-    return _download.download_smoke_images(runner, cfg, run_id=run_id, dest_dir=dest, overwrite=overwrite)
+    with _locks.operation(runner, cfg, session_id, label="download"):
+        return _download.download_smoke_images(runner, cfg, run_id=run_id, dest_dir=dest, overwrite=overwrite)
 
 
 def download_outputs(
@@ -254,13 +254,15 @@ def download_outputs(
     instance_id: int | str,
     dest: Path | str,
     *,
+    session_id: str,
     pattern: str = "*.png",
     limit: int = 100,
     overwrite: bool = False,
     client: VastClient | None = None,
 ) -> dict:
     _, runner = _runner(cfg, instance_id, client)
-    return _download.download_outputs(runner, cfg, dest_dir=dest, pattern=pattern, limit=limit, overwrite=overwrite)
+    with _locks.operation(runner, cfg, session_id, label="download"):
+        return _download.download_outputs(runner, cfg, dest_dir=dest, pattern=pattern, limit=limit, overwrite=overwrite)
 
 
 def instance_show(cfg: Config, instance_id: int | str, *, client: VastClient | None = None) -> dict:

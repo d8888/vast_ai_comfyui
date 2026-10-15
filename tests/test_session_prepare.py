@@ -9,6 +9,12 @@ from vast_comfy import locks, prepare, remote
 from vast_comfy.errors import VastComfyError
 
 
+@pytest.fixture(autouse=True)
+def isolate_bootstrap_transport(monkeypatch):
+    # These are controller protocol tests, not the real bootstrap entrypoint.
+    monkeypatch.setattr(locks, "ensure_bootstrap", lambda *_: "/runtime/bootstrap/test")
+
+
 # ---------------------------------------------------------------------------
 # locks.acquire / assert_owns
 # ---------------------------------------------------------------------------
@@ -101,7 +107,10 @@ def _prepare_runner(job_state: str, summary: dict | None) -> FakeRunner:
     # deploy_package: dirs, package verification (already present), symlink.
     runner.add_rule("mkdir", rc=0)
     runner.add_json("verify-package", {"ok": True, "checked": 21, "problems": []})
-    runner.add_rule("ln -sfn", rc=0)
+    runner.add_rule("ln -s", rc=0)
+    runner.add_rule("mv -T", rc=0)
+    runner.add_json("vc_session.py begin-operation", {"ok": True})
+    runner.add_json("vc_session.py end-operation", {"ok": True})
     runner.add_json("vc_session.py acquire", {"ok": True, "status": "acquired", "owner": {"session_id": "sess-1"}})
     runner.add_json("vc_session.py release", {"ok": True, "status": "released", "released_at": 111.0})
     runner.add_json(
@@ -199,9 +208,12 @@ def test_deploy_package_skips_upload_when_remote_is_verified(cfg):
     runner = FakeRunner()
     runner.add_rule("mkdir", rc=0)
     runner.add_json("verify-package", {"ok": True, "checked": 21, "problems": []})
-    runner.add_rule("ln -sfn", rc=0)
+    runner.add_rule("ln -s", rc=0)
+    runner.add_rule("mv -T", rc=0)
+    runner.add_json("vc_session.py begin-operation", {"ok": True})
+    runner.add_json("vc_session.py end-operation", {"ok": True})
 
-    result = remote.deploy_package(runner, cfg)
+    result = remote.deploy_package(runner, cfg, session_id="sess-1")
 
     assert result["verified"] is True
     assert result["already_present"] is True
@@ -214,10 +226,13 @@ def test_deploy_package_uploads_and_verifies_when_missing(cfg):
     runner.add_rule("mkdir", rc=0)
     # Probe against the *current* link fails -> the package is uploaded.
     runner.add_rule("current/remote/vc_common.py", stdout="probe-not-json\n", rc=1)
-    runner.add_rule("ln -sfn", rc=0)
+    runner.add_rule("ln -s", rc=0)
+    runner.add_rule("mv -T", rc=0)
+    runner.add_json("vc_session.py begin-operation", {"ok": True})
+    runner.add_json("vc_session.py end-operation", {"ok": True})
     runner.add_json("vc_common.py", {"ok": True, "checked": 21, "problems": []})
 
-    result = remote.deploy_package(runner, cfg)
+    result = remote.deploy_package(runner, cfg, session_id="sess-1")
 
     assert result["uploaded"] > 0
     assert result["verified"] is True
@@ -230,9 +245,11 @@ def test_deploy_package_fails_when_remote_verification_fails(cfg):
     runner = FakeRunner()
     runner.add_rule("mkdir", rc=0)
     runner.add_rule("current/remote/vc_common.py", stdout="probe-not-json\n", rc=1)
+    runner.add_json("vc_session.py begin-operation", {"ok": True})
+    runner.add_json("vc_session.py end-operation", {"ok": True})
     runner.add_json("vc_common.py", {"ok": False, "checked": 21, "problems": ["sha256 mismatch: remote/vc_smoke.py"]})
 
     with pytest.raises(VastComfyError) as excinfo:
-        remote.deploy_package(runner, cfg)
+        remote.deploy_package(runner, cfg, session_id="sess-1")
     assert excinfo.value.code == "E_DEPLOY"
     assert "not trusted" in excinfo.value.message

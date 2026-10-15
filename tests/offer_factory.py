@@ -26,6 +26,7 @@ def make_offer(**overrides: Any) -> dict[str, Any]:
         "compute_cap": 890,
         "cuda_max_good": 12.9,
         "gpu_frac": 1.0,
+        "disk_space": 500.0,
         "gpu_arch": "nvidia",
         "cpu_arch": "amd64",
         "verified": True,

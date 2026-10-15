@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import pytest
+
 from vast_comfy.config import load_config
+from vast_comfy.errors import ConfigError
 from vast_comfy.vast.offers import build_search_query
 
 
@@ -42,10 +45,9 @@ def test_gpu_ram_bounds_from_alias(mapping):
     assert "gpu_ram" not in plain
 
 
-def test_gpu_ram_floor_override_widens_the_lower_bound(mapping):
-    query, _, _ = query_for(mapping, **{"gpu.vram_gb_min": 17})
-    assert query["gpu_ram"]["lte"] == 17000
-    assert query["gpu_ram"]["gte"] == 17 * 1024
+def test_gpu_ram_floor_cannot_contradict_alias_maximum(mapping):
+    with pytest.raises(ConfigError, match="contradicts"):
+        query_for(mapping, **{"gpu.vram_gb_min": 17})
 
 
 def test_cpu_ram_is_converted_gb_to_mb_with_1000(mapping):

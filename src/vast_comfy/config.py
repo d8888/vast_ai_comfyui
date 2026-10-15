@@ -12,6 +12,7 @@ Strictness rules:
 from __future__ import annotations
 
 import copy
+import math
 import os
 import re
 import sys
@@ -255,6 +256,8 @@ def _require_number(data: dict[str, Any], path: str, *, minimum: float | None = 
         raise ConfigError(f"Config field {path} is required")
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ConfigError(f"Config field {path} must be a number")
+    if not math.isfinite(value):
+        raise ConfigError(f"Config field {path} must be finite (NaN and infinity are rejected)")
     if integral and int(value) != value:
         raise ConfigError(f"Config field {path} must be an integer")
     if minimum is not None and value < minimum:
@@ -350,6 +353,9 @@ def _validate_semantics(data: dict[str, Any]) -> None:
         )
     if ssh["user"] != "root":
         raise ConfigError("ssh.user must be 'root' for Vast.ai Docker instances")
+    for key in ("key_path", "known_hosts_path"):
+        if ssh[key] is not None and (not isinstance(ssh[key], str) or not ssh[key]):
+            raise ConfigError(f"ssh.{key} must be a non-empty path string or null")
     _require_number(ssh["connect_timeout_seconds"], "ssh.connect_timeout_seconds", minimum=1)
     _require_number(ssh["command_timeout_seconds"], "ssh.command_timeout_seconds", minimum=1)
     _require_number(ssh["server_alive_interval_seconds"], "ssh.server_alive_interval_seconds", minimum=0)

@@ -328,13 +328,12 @@ def cmd_instance_wait_ready(ctx: Ctx, args) -> dict:
 
 
 def cmd_instance_stop(ctx: Ctx, args) -> dict:
-    ctx.client.stop_instance(args.instance)
-    ctx.state.record_instance(args.instance, state="stopped")
-    return {
-        "instance_id": args.instance,
-        "stopped": True,
-        "billing_note": "Stopped instances keep billing storage. Destroy is the only way to end storage charges.",
-    }
+    from .lifecycle import stop
+
+    sid = ctx.require_session(args.session_id, args.instance)
+    result = stop(ctx.client, ctx.cfg, args.instance, sid)
+    ctx.state.record_instance(args.instance, state="stop_requested")
+    return result
 
 
 def cmd_instance_destroy(ctx: Ctx, args) -> dict:
@@ -343,9 +342,12 @@ def cmd_instance_destroy(ctx: Ctx, args) -> dict:
             "Destroying an instance requires the explicit --confirm-destroy flag "
             "(paid confirmation does not imply data-destruction confirmation)"
         )
-    ctx.client.destroy_instance(args.instance)
-    ctx.state.record_instance(args.instance, state="destroyed")
-    return {"instance_id": args.instance, "destroyed": True}
+    from .lifecycle import destroy
+
+    sid = ctx.require_session(args.session_id, args.instance)
+    result = destroy(ctx.client, ctx.cfg, args.instance, sid, confirm_destroy=True)
+    ctx.state.record_instance(args.instance, state="destroy_requested")
+    return result
 
 
 def cmd_instance_logs(ctx: Ctx, args) -> dict:
@@ -447,15 +449,14 @@ def cmd_deploy_package(ctx: Ctx, args) -> dict:
     from .remote import deploy_package
 
     _, runner = ctx.instance_and_runner(args.instance)
-    return deploy_package(runner, ctx.cfg)
+    sid = ctx.require_session(args.session_id, args.instance)
+    return deploy_package(runner, ctx.cfg, session_id=sid)
 
 
 def cmd_session_acquire(ctx: Ctx, args) -> dict:
     from .locks import acquire
-    from .remote import deploy_package
 
-    instance, runner = ctx.instance_and_runner(args.instance)
-    deploy = deploy_package(runner, ctx.cfg)
+    _, runner = ctx.instance_and_runner(args.instance)
     payload = acquire(runner, ctx.cfg, args.instance, session_id=args.session_id)
     ctx.state.record_session(
         payload["session_id"],
@@ -464,15 +465,13 @@ def cmd_session_acquire(ctx: Ctx, args) -> dict:
         acquired_at=time.time(),
         owner=payload.get("owner"),
     )
-    return {**payload, "deploy": deploy}
+    return payload
 
 
 def cmd_session_status(ctx: Ctx, args) -> dict:
     from .locks import status
-    from .remote import deploy_package
 
     _, runner = ctx.instance_and_runner(args.instance)
-    deploy_package(runner, ctx.cfg)
     return status(runner, ctx.cfg, session_id=args.session_id)
 
 
@@ -488,7 +487,6 @@ def cmd_session_release(ctx: Ctx, args) -> dict:
 
 def cmd_session_recover(ctx: Ctx, args) -> dict:
     from .locks import recover
-    from .remote import deploy_package
 
     if not args.accept_stale:
         raise UsageError(
@@ -496,7 +494,6 @@ def cmd_session_recover(ctx: Ctx, args) -> dict:
             "the previous owner and its work are gone. vast-comfy never takes over a stale lock automatically."
         )
     _, runner = ctx.instance_and_runner(args.instance)
-    deploy_package(runner, ctx.cfg)
     payload = recover(runner, ctx.cfg, args.instance, session_id=args.session_id)
     ctx.state.record_session(
         payload["session_id"], instance_id=str(args.instance), state="active", recovered_at=time.time()
@@ -509,7 +506,7 @@ def cmd_jobs_start(ctx: Ctx, args) -> dict:
 
     _, runner = ctx.instance_and_runner(args.instance)
     session_id = ctx.require_session(args.session_id, args.instance)
-    argv = args.command[1:] if args.command and args.command[0] == "--" else args.command
+    argv = args.job_command[1:] if args.job_command and args.job_command[0] == "--" else args.job_command
     if not argv:
         raise UsageError("jobs start requires the command after '--'")
     payload = jobs.start(
@@ -569,7 +566,8 @@ def cmd_install_run(ctx: Ctx, args) -> dict:
     _, runner = ctx.instance_and_runner(args.instance)
     session_id = ctx.require_session(args.session_id, args.instance)
     manifest = build_install_manifest()
-    from .prepare import b64_json
+    from .prepare import assert_no_remote_credentials, b64_json
+    assert_no_remote_credentials(manifest)
 
     argv = [
         "run",
@@ -623,7 +621,7 @@ def cmd_install_verify(ctx: Ctx, args) -> dict:
     session_id = ctx.require_session(args.session_id, args.instance)
     assert_owns(runner, ctx.cfg, session_id)
     manifest = build_install_manifest()
-    argv = ["verify", "--manifest-b64", b64_json(manifest)]
+    argv = ["verify", "--session-id", session_id, "--manifest-b64", b64_json(manifest)]
     if args.verify_shas:
         argv.append("--verify-shas")
     return invoke(runner, ctx.cfg, "vc_install.py", argv, timeout_seconds=1800)
@@ -714,50 +712,51 @@ def cmd_smoke_run(ctx: Ctx, args) -> dict:
 
 
 def cmd_smoke_report(ctx: Ctx, args) -> dict:
-    from . import smoke
+    from . import locks, smoke
 
-    runner, _ = ctx.instance_and_runner(args.instance)
+    _, runner = ctx.instance_and_runner(args.instance)
     session_id = ctx.require_session(args.session_id, args.instance)
-    from .locks import assert_owns
-
-    assert_owns(runner, ctx.cfg, session_id)
-    return smoke.show_report(runner, ctx.cfg, args.run_id)
+    with locks.operation(runner, ctx.cfg, session_id, label="report"):
+        return smoke.show_report(runner, ctx.cfg, args.run_id)
 
 
 def cmd_download_report(ctx: Ctx, args) -> dict:
     from . import download as dl
-    from .locks import assert_owns
+    from . import locks
 
-    runner, session_id = ctx.instance_and_runner(args.instance)
-    assert_owns(runner, ctx.cfg, session_id)
-    return dl.download_report(runner, ctx.cfg, run_id=args.run_id, dest_dir=args.dest, overwrite=args.overwrite)
+    _, runner = ctx.instance_and_runner(args.instance)
+    session_id = ctx.require_session(args.session_id, args.instance)
+    with locks.operation(runner, ctx.cfg, session_id, label="download"):
+        return dl.download_report(runner, ctx.cfg, run_id=args.run_id, dest_dir=args.dest, overwrite=args.overwrite)
 
 
 def cmd_download_images(ctx: Ctx, args) -> dict:
     from . import download as dl
-    from .locks import assert_owns
+    from . import locks
 
-    runner, session_id = ctx.instance_and_runner(args.instance)
-    assert_owns(runner, ctx.cfg, session_id)
-    return dl.download_smoke_images(
-        runner, ctx.cfg, run_id=args.run_id, dest_dir=args.dest, overwrite=args.overwrite
-    )
+    _, runner = ctx.instance_and_runner(args.instance)
+    session_id = ctx.require_session(args.session_id, args.instance)
+    with locks.operation(runner, ctx.cfg, session_id, label="download"):
+        return dl.download_smoke_images(
+            runner, ctx.cfg, run_id=args.run_id, dest_dir=args.dest, overwrite=args.overwrite
+        )
 
 
 def cmd_download_outputs(ctx: Ctx, args) -> dict:
     from . import download as dl
-    from .locks import assert_owns
+    from . import locks
 
-    runner, session_id = ctx.instance_and_runner(args.instance)
-    assert_owns(runner, ctx.cfg, session_id)
-    return dl.download_outputs(
-        runner,
-        ctx.cfg,
-        dest_dir=args.dest,
-        pattern=args.pattern,
-        limit=args.limit,
-        overwrite=args.overwrite,
-    )
+    _, runner = ctx.instance_and_runner(args.instance)
+    session_id = ctx.require_session(args.session_id, args.instance)
+    with locks.operation(runner, ctx.cfg, session_id, label="download"):
+        return dl.download_outputs(
+            runner,
+            ctx.cfg,
+            dest_dir=args.dest,
+            pattern=args.pattern,
+            limit=args.limit,
+            overwrite=args.overwrite,
+        )
 
 
 def cmd_flow_prepare(ctx: Ctx, args) -> dict:
@@ -915,9 +914,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_instance_wait_ready)
     p = g.sub.add_parser("stop", help="stop an instance (storage billing continues)", parents=[common])
     p.add_argument("--instance", required=True)
+    p.add_argument("--session-id", default=None)
     p.set_defaults(func=cmd_instance_stop)
     p = g.sub.add_parser("destroy", help="destroy an instance (irreversible; needs --confirm-destroy)", parents=[common])
     p.add_argument("--instance", required=True)
+    p.add_argument("--session-id", default=None)
     p.add_argument("--confirm-destroy", action="store_true")
     p.set_defaults(func=cmd_instance_destroy)
     p = g.sub.add_parser("logs", help="fetch container logs", parents=[common])
@@ -956,6 +957,7 @@ def build_parser() -> argparse.ArgumentParser:
     g = add_group("deploy", "management package deployment")
     p = g.sub.add_parser("package", help="deploy + verify the whitelisted management package", parents=[common])
     p.add_argument("--instance", required=True)
+    p.add_argument("--session-id", default=None)
     p.set_defaults(func=cmd_deploy_package)
 
     # session
@@ -985,7 +987,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--session-id", default=None)
     p.add_argument("--name", required=True)
     p.add_argument("--timeout-minutes", type=float, required=True)
-    p.add_argument("command", nargs=argparse.REMAINDER)
+    p.add_argument("job_command", nargs=argparse.REMAINDER)
     p.set_defaults(func=cmd_jobs_start)
     p = g.sub.add_parser("status", help="job status", parents=[common])
     p.add_argument("--instance", required=True)

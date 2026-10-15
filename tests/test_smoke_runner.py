@@ -118,8 +118,9 @@ def test_full_four_case_pass_reports_ready(smoke_env):
     assert report["instance_id"] == "4242"
     assert report["image"] == "vastai/comfy:v0.40.0-cuda-12.9-py312"
     assert [c["seed"] for c in report["cases"]] == [
-        BASE_SEED + (RUN_TOKEN + i) % 1_000_000 for i in range(4)
+        prompt["6"]["inputs"]["seed"] for prompt in smoke_env.fake.prompts
     ]
+    assert all(0 <= c["seed"] < 2**64 for c in report["cases"])
     for case in report["cases"]:
         assert case["images"] and case["images"][0]["width"] == 1024
         assert case["images"][0]["height"] == 1024
@@ -133,7 +134,7 @@ def test_full_four_case_pass_reports_ready(smoke_env):
 
     summary = summary_of(smoke_env)
     assert summary["verdict"] == "READY"
-    assert summary["cases"][0]["seed"] == BASE_SEED + RUN_TOKEN
+    assert summary["cases"][0]["seed"] == report["cases"][0]["seed"]
     markdown = (run_dir / "report.md").read_text(encoding="utf-8")
     assert "READY" in markdown and "base_t2i" in markdown
 
@@ -145,11 +146,12 @@ def test_full_four_case_pass_reports_ready(smoke_env):
     assert len(set(seeds)) == 4
 
 
-def test_fixed_seed_mode_reuses_the_base_seed(smoke_env):
-    result, _ = run_suite(smoke_env, cases=smoke_env.cases, unique_seed=False)
-    assert result["verdict"] == "READY"
-    seeds = [c["seed"] for c in report_of(smoke_env)["cases"]]
-    assert seeds == [BASE_SEED] * 4
+def test_fixed_seed_mode_refuses_possible_cached_inference(smoke_env):
+    result, exit_code = run_suite(smoke_env, cases=smoke_env.cases, unique_seed=False)
+    assert exit_code != 0
+    assert result["code"] == "E_CONFIG"
+    assert result["reason"] == "SMOKE_CACHE"
+    assert smoke_env.fake.prompts == []
 
 
 def test_subset_run_reports_partial(smoke_env):

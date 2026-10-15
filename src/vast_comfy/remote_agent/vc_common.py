@@ -11,11 +11,14 @@ needed. Nothing here reads or writes outside:
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
+import re
 import sys
 import time
+import uuid
 from pathlib import Path
 
 RUNTIME_DIR = Path(os.environ.get("VAST_COMFY_RUNTIME_DIR", "/workspace/.vast_comfy"))
@@ -27,6 +30,8 @@ LOCK_FILE = LOCK_DIR / "owner.lock"
 OWNER_FILE = LOCK_DIR / "owner.json"
 OWNER_HISTORY = LOCK_DIR / "owner_history.jsonl"
 RELEASE_REQUEST = LOCK_DIR / "release.request"
+OPERATION_FILE = LOCK_DIR / "operation.lock"
+OPERATION_OWNER = LOCK_DIR / "operation.json"
 JOBS_DIR = RUNTIME_DIR / "jobs"
 RUNS_DIR = RUNTIME_DIR / "runs"
 DOWNLOADS_DIR = RUNTIME_DIR / "downloads"
@@ -88,21 +93,36 @@ def fail(code: str, message: str, *, exit_code: int = 1, **details: object) -> N
     raise RemoteFail(code, message, exit_code=exit_code, details=dict(details))
 
 
-def run_cli(func, args) -> None:
+def redact(text: str) -> str:
+    text = re.sub(r"(?i)(bearer\s+)\S+", r"\1<redacted>", str(text))
+    for name, value in os.environ.items():
+        if len(value) >= 8 and any(word in name.upper() for word in ("TOKEN", "PASSWORD", "SECRET", "API_KEY")):
+            text = text.replace(value, "<redacted>")
+    return text
+
+
+def run_cli(func, args, *, guard: bool = False) -> None:
     """Dispatch a subcommand, converting RemoteFail into structured JSON."""
     try:
-        result = func(args)
+        if guard:
+            with operation(args.session_id, label=func.__name__):
+                result = func(args)
+        else:
+            result = func(args)
     except RemoteFail as exc:
         payload = {"ok": False, "code": exc.code, "message": exc.message}
         payload.update(exc.details)
         emit(payload, exit_code=exc.exit_code)
+    except Exception as exc:
+        emit({"ok": False, "code": "E_INTERNAL", "message": redact(str(exc)),
+              "stage": func.__name__, "takeover_required": True}, exit_code=1)
     if isinstance(result, dict):
         emit(result)
 
 
 def atomic_write_json(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
+    tmp = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(payload, fh, indent=2, sort_keys=True)
         fh.write("\n")
@@ -137,6 +157,12 @@ def sha256_file(path: Path, chunk_size: int = 4 * 1024 * 1024) -> str:
 def pid_alive(pid: int | None) -> bool:
     if not pid or pid <= 0:
         return False
+    if sys.platform == "linux":
+        try:
+            if (Path("/proc") / str(pid) / "stat").read_text().rsplit(")", 1)[1].split()[0] == "Z":
+                return False
+        except (OSError, IndexError):
+            pass
     try:
         os.kill(int(pid), 0)
     except ProcessLookupError:
@@ -220,6 +246,114 @@ def ensure_owns(session_id: str) -> dict:
     return owner
 
 
+def operation_held() -> bool:
+    """Probe the separate per-operation kernel lock, without changing its inode."""
+    import fcntl
+    ensure_dirs()
+    fd = os.open(OPERATION_FILE, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(fd)
+
+
+def child_process_options() -> dict:
+    """Carry the actual operation lock through our managed child processes."""
+    raw = os.environ.get("VAST_COMFY_OPERATION_FD")
+    if not raw:
+        return {}
+    fd = int(raw)
+    os.fstat(fd)  # Fail closed if the inherited descriptor was lost.
+    return {"pass_fds": (fd,)}
+
+
+class OperationLease:
+    def __init__(self, fd, token):
+        self.fd, self.token, self.handed_off = fd, token, False
+
+    def handoff(self):
+        self.handed_off = True
+
+
+def finish_operation(token: str) -> None:
+    owner = read_json(OPERATION_OWNER, {}) or {}
+    if owner.get("token") == token:
+        owner.update(state="released", ended_at=now_epoch())
+        atomic_write_json(OPERATION_OWNER, owner)
+
+
+def check_deadline() -> None:
+    deadline = os.environ.get("VAST_COMFY_JOB_DEADLINE")
+    if deadline and now_epoch() >= float(deadline):
+        fail("E_JOB_TIMEOUT", "The job deadline was exceeded; no next stage was started.",
+             job_may_still_be_running=False, takeover_required=True)
+
+
+@contextlib.contextmanager
+def operation(session_id: str, *, label: str = "operation", token: str | None = None):
+    """Nonblocking operation lock; delegated work must name the live lease.
+
+    The session daemon and this lock are separate: a second operation in the
+    same session fails too. Jobs inherit the descriptor so controller disconnect
+    or session-daemon death cannot remove their actual exclusion.
+    """
+    import fcntl
+    ensure_dirs()
+    delegated = os.environ.get("VAST_COMFY_OPERATION_TOKEN")
+    if delegated:
+        record = read_json(OPERATION_OWNER, {}) or {}
+        if (record.get("token") != delegated or record.get("session_id") != session_id
+                or record.get("state") != "active" or not operation_held()):
+            fail("E_LOCK_NOT_HELD", "The delegated operation lease is no longer valid.", exit_code=4)
+        ensure_owns(session_id)
+        raw_fd = os.environ.get("VAST_COMFY_OPERATION_FD")
+        if raw_fd:
+            try:
+                actual, expected = os.fstat(int(raw_fd)), os.stat(OPERATION_FILE)
+            except OSError:
+                fail("E_LOCK_NOT_HELD", "The inherited operation descriptor is gone.", exit_code=4)
+            if (actual.st_dev, actual.st_ino) != (expected.st_dev, expected.st_ino):
+                fail("E_LOCK_NOT_HELD", "Inherited operation descriptor does not match the lock.", exit_code=4)
+        yield OperationLease(None, delegated)
+        return
+    fd = os.open(OPERATION_FILE, os.O_RDWR | os.O_CREAT, 0o600)
+    lease = OperationLease(fd, token or uuid.uuid4().hex)
+    acquired = False
+    previous = {k: os.environ.get(k) for k in
+                ("VAST_COMFY_OPERATION_TOKEN", "VAST_COMFY_OPERATION_FD", "VAST_COMFY_SESSION_ID")}
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            acquired = True
+        except BlockingIOError:
+            fail("E_LOCK_CONFLICT", "Another operation is running, including in this session.",
+                 exit_code=4, operation=read_json(OPERATION_OWNER, {}))
+        ensure_owns(session_id)
+        alive = session_jobs(session_id, alive_only=True)
+        if alive:
+            fail("E_LOCK_JOBS_RUNNING", "Existing remote work is still alive.", exit_code=4, jobs=alive)
+        atomic_write_json(OPERATION_OWNER, {"state": "active", "token": lease.token,
+                          "session_id": session_id, "label": label,
+                          "pid": os.getpid(), "started_at": now_epoch()})
+        os.environ.update(VAST_COMFY_OPERATION_TOKEN=lease.token,
+                          VAST_COMFY_OPERATION_FD=str(fd), VAST_COMFY_SESSION_ID=session_id)
+        yield lease
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        if acquired and not lease.handed_off:
+            finish_operation(lease.token)
+        os.close(fd)  # Do not LOCK_UN: a handed-off descriptor belongs to the job.
+
+
 def session_jobs(session_id: str, *, alive_only: bool = False) -> list:
     """Job records belonging to a session; optionally only those still alive."""
     records = []
@@ -239,7 +373,8 @@ def session_jobs(session_id: str, *, alive_only: bool = False) -> list:
             "pid": pid,
             "pid_alive": pid_alive(pid) if pid else False,
         }
-        if alive_only and not (state == "running" and record["pid_alive"]):
+        record["runner_alive"] = pid_alive(meta.get("pid"))
+        if alive_only and not (record["pid_alive"] or record["runner_alive"]):
             continue
         records.append(record)
     return records
@@ -296,7 +431,7 @@ def main(argv: list[str] | None = None) -> None:
     p.set_defaults(func=cmd_instance_time)
 
     args = parser.parse_args(argv)
-    C.run_cli(args.func, args)
+    run_cli(args.func, args)
 
 
 if __name__ == "__main__":

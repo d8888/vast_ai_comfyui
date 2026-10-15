@@ -10,6 +10,7 @@ from .config import Config
 from .errors import E_NO_OFFERS, VastComfyError
 from .gpu import load_mapping
 from .instances import runner_for
+from .ssh import rental_preflight, wait_for_ssh
 from .vast.client import VastClient
 from .vast.offers import (
     build_search_query,
@@ -99,6 +100,8 @@ def create_and_prepare(
     from .prepare import assert_no_remote_credentials, build_install_manifest
 
     assert_no_remote_credentials(build_install_manifest())
+    if confirm_paid:
+        rental_preflight(client, cfg)
 
     spec = load_mapping().resolve(alias)
     quote = quote_for_alias(client, cfg, alias)
@@ -112,14 +115,12 @@ def create_and_prepare(
     created = create_instance(client, cfg, fresh, final_label, paid_confirmed=confirm_paid)
     step("created", created)
 
-    instance = wait_for_running(client, created["instance_id"], cfg, on_poll=lambda inst: step("waiting", inst))
-    step("running", {"instance_id": instance.get("id"), "gpu_name": instance.get("gpu_name")})
-
-    runner = runner_for(instance, cfg)
-    runner.check_login()
-    step("ssh_ok", {"ssh_host": instance.get("ssh_host"), "ssh_port": instance.get("ssh_port")})
-
     try:
+        instance = wait_for_running(client, created["instance_id"], cfg, on_poll=lambda inst: step("waiting", inst))
+        step("running", {"instance_id": instance.get("id"), "gpu_name": instance.get("gpu_name")})
+        runner = runner_for(instance, cfg)
+        wait_for_ssh(runner, cfg)
+        step("ssh_ok", {"ssh_host": instance.get("ssh_host"), "ssh_port": instance.get("ssh_port")})
         result = prepare.prepare_existing(
             runner,
             cfg,

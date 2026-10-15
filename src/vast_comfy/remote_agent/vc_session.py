@@ -83,11 +83,19 @@ def cmd_acquire(args) -> None:
             **_stale_report(owner),
         )
 
+    if C.operation_held():
+        C.fail(
+            "E_LOCK_JOBS_RUNNING",
+            "Remote work still holds the operation lock; no session may take over.",
+            exit_code=4,
+            operation=C.read_json(C.OPERATION_OWNER, {}),
+        )
+
     # Lock is free: is there a stale foreign owner record?
     stale_foreign = bool(owner and owner.get("state") == "active" and owner.get("session_id") != session_id)
     if stale_foreign:
         report = _stale_report(owner)
-        alive_jobs = [j for j in report["jobs"] if j.get("state") == "running" and j.get("pid_alive")]
+        alive_jobs = C.session_jobs(str(owner.get("session_id")), alive_only=True)
         if alive_jobs:
             C.fail(
                 "E_LOCK_JOBS_RUNNING",
@@ -203,6 +211,11 @@ def cmd_daemon(args) -> None:
         os.close(fd)
         sys.exit(4)
 
+    if C.operation_held() or (owner and C.session_jobs(str(owner.get("session_id")), alive_only=True)):
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+        sys.exit(4)
+
     record = {
         "state": "active",
         "session_id": args.session_id,
@@ -230,11 +243,7 @@ def cmd_daemon(args) -> None:
                     C.RELEASE_REQUEST.unlink(missing_ok=True)
                     blocked_file = C.LOCK_DIR / "release.blocked"
                     blocked_file.unlink(missing_ok=True)
-                    alive = [
-                        j
-                        for j in C.session_jobs(args.session_id)
-                        if j.get("state") == "running" and j.get("pid_alive")
-                    ]
+                    alive = C.session_jobs(args.session_id, alive_only=True)
                     if alive:
                         # Refuse to release: work is still running and must not be
                         # left behind unsynchronized. Report and keep holding.
@@ -276,6 +285,8 @@ def cmd_status(args) -> None:
         "ok": True,
         "lock_held": held,
         "daemon_alive": daemon_alive,
+        "operation_held": C.operation_held(),
+        "operation": C.read_json(C.OPERATION_OWNER, {}),
         "matches_me": bool(
             args.session_id
             and held
@@ -303,9 +314,7 @@ def cmd_release(args) -> None:
             exit_code=4,
             owner=owner,
         )
-    alive = [
-        j for j in C.session_jobs(args.session_id) if j.get("state") == "running" and j.get("pid_alive")
-    ]
+    alive = C.session_jobs(args.session_id, alive_only=True)
     if alive:
         C.fail(
             "E_LOCK_JOBS_RUNNING",
@@ -353,6 +362,50 @@ def cmd_list_jobs(args) -> None:
     C.emit({"ok": True, "jobs": C.session_jobs(args.session_id) if args.session_id else []})
 
 
+def cmd_begin_operation(args) -> None:
+    C.ensure_owns(args.session_id)
+    if C.operation_held():
+        C.fail("E_LOCK_CONFLICT", "Another operation is already active.", exit_code=4,
+               operation=C.read_json(C.OPERATION_OWNER, {}))
+    proc = subprocess.Popen(
+        [sys.executable, str(Path(__file__).resolve()), "operation-daemon", "--session-id",
+         args.session_id, "--operation-token", args.operation_token, "--label", args.label],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        record = C.read_json(C.OPERATION_OWNER, {}) or {}
+        if record.get("token") == args.operation_token and record.get("state") == "active" and C.operation_held():
+            C.emit({"ok": True, "operation_token": args.operation_token})
+        if proc.poll() is not None:
+            C.fail("E_LOCK_CONFLICT", "The operation could not acquire exclusive ownership.", exit_code=4)
+        time.sleep(0.05)
+    C.fail("E_LOCK_NOT_HELD", "Operation acquisition outcome uncertain; inspect session status.", exit_code=4)
+
+
+def cmd_operation_daemon(args) -> None:
+    with C.operation(args.session_id, label=args.label, token=args.operation_token):
+        request = C.LOCK_DIR / ("operation-release-" + args.operation_token)
+        while not request.exists():
+            time.sleep(0.1)
+        request.unlink()
+
+
+def cmd_end_operation(args) -> None:
+    record = C.read_json(C.OPERATION_OWNER, {}) or {}
+    if record.get("session_id") != args.session_id or record.get("token") != args.operation_token:
+        C.fail("E_LOCK_NOT_HELD", "Operation ownership changed; nothing was released.", exit_code=4)
+    (C.LOCK_DIR / ("operation-release-" + args.operation_token)).touch()
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        current = C.read_json(C.OPERATION_OWNER, {}) or {}
+        if current.get("token") != args.operation_token or current.get("state") == "released":
+            C.emit({"ok": True, "operation_released": True})
+        time.sleep(0.05)
+    C.fail("E_LOCK_NOT_HELD", "Operation release outcome uncertain; inspect session status.", exit_code=4)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="vast-comfy remote session lock")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -392,13 +445,26 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--session-id", default="")
     p.set_defaults(func=cmd_list_jobs)
 
+    for command, func in (("begin-operation", cmd_begin_operation),
+                          ("operation-daemon", cmd_operation_daemon),
+                          ("end-operation", cmd_end_operation)):
+        p = sub.add_parser(command)
+        p.add_argument("--session-id", required=True)
+        p.add_argument("--operation-token", required=True)
+        p.add_argument("--label", default="operation")
+        p.set_defaults(func=func)
+
     return parser
 
 
 def main(argv=None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
-    C.run_cli(args.func, args)
+    if hasattr(args, "operation_token"):
+        import re
+        if not re.fullmatch(r"[0-9a-f]{32}", args.operation_token):
+            C.run_cli(lambda _: C.fail("E_USAGE", "Invalid operation token", exit_code=4), args)
+    C.run_cli(args.func, args, guard=args.command == "release")
 
 
 if __name__ == "__main__":

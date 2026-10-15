@@ -265,10 +265,10 @@ vast-comfy --env-file .env ssh tunnel --instance <ID> --stop
 
 ## 8. 獨占 session、心跳與衝突處置
 
-同一時間只允許一個工具包 session 操作一個 instance。
+同一時間只允許一個工具包 session 操作一個 instance；同一個 session 內也以**操作鎖**確保同一時間只有一個修改型操作。
 
 ```bash
-vast-comfy --env-file .env session acquire --instance <ID>       # 取得獨占（自動部署管理元件）
+vast-comfy --env-file .env session acquire --instance <ID>       # 取得獨占（僅先上傳最小鎖元件）
 vast-comfy --env-file .env session status  --instance <ID>       # 唯讀診斷
 vast-comfy --env-file .env session release --instance <ID> --session-id <SID>
 vast-comfy --env-file .env session recover --instance <ID> --accept-stale   # 明確的人工復原
@@ -277,11 +277,13 @@ vast-comfy --env-file .env session recover --instance <ID> --accept-stale   # �
 機制：
 
 - 真正的互斥由 instance 上的 **Linux `flock`** 提供，由一個背景 daemon 全程持有；`owner.json`（session、取得時間、最後心跳、控制端、daemon pid）只用於診斷。
+- **兩層排他**：`session` 鎖（跨控制端獨占）＋每次操作的**操作鎖**（同一 session 也不能同時跑兩個部署／下載／工作）。操作鎖由實際執行工作的程序或其背景 job 繼承持有，控制端斷線或 session daemon 結束都不會提前解除。
+- 取得 session 前只會上傳**最小鎖元件**（`vc_common.py`／`vc_session.py` 的內容雜湊版本）；完整管理套件只在你持有所有權後才部署，衝突的另一方不會改到正在使用的程式碼。
 - **心跳自動更新**：每 30 秒；有效期 300 秒；額外緩衝 60 秒。時間以**instance 的時鐘**為準。
 - 衝突時立即失敗（exit code 4）並顯示持有者資訊；**不排隊、不搶鎖、不殺 Agent、不取消工作**。
 - 心跳過期只「回報」（時間、持有者、進行中工作、實際鎖狀態），**不會**自動接手。
-- 遠端工作存活期間，`flock` 實際持有，不代表過期就能插入。
-- 釋放前若該 session 仍有存活工作 → 拒絕釋放（`E_LOCK_JOBS_RUNNING`）。
+- 遠端工作存活期間，`flock` 實際持有，不代表過期就能插入；工作逾時只標記 `overdue` 並持續等待，**不會**代你終止。
+- 釋放前若該 session 仍有存活工作或操作進行中 → 拒絕釋放（`E_LOCK_JOBS_RUNNING`／`E_LOCK_CONFLICT`）。
 
 **為什麼不能靠刪除鎖檔解鎖？**
 `flock` 綁在檔案的 inode 上：刪掉鎖檔並重建會產生另一個 inode，舊持有者仍鎖著舊檔案，兩邊都以為自己拿到鎖。因此本工具的任何流程都不會刪除或重建鎖檔；人工復原請在 instance 上確認舊持有者與工作都已結束後，使用 `session recover --accept-stale`（明確表達「你已親自確認」）。
@@ -432,10 +434,12 @@ vast-comfy --env-file .env download outputs --instance <ID> --session-id <SID> -
 - 正常流程成功後 instance 與 ComfyUI 持續運作；本工具**不會**自動關機。
 - `stop`：保留資料，**仍持續收硬碟費**；重新啟動不保證取回原 GPU。
 - `destroy`：**永久刪除 instance 內所有資料**（本工具 v1 不使用獨立 volume）。需要 `--confirm-destroy`，同意租用不等於同意刪資料。
+- `stop`／`destroy` 也是**修改操作**：必須指定仍持有獨占權的 session（`--session-id`），執行前會先取得遠端操作鎖並驗證所有權；API 未確認成功時回報 `E_UPSTREAM`，不假裝已停止或已銷毀。
+- 因為 instance 可能在命令被接受後立即失聯，`stop`／`destroy` 成功受理後**刻意保留**遠端鎖，等待平台轉換完成後由你或後續人工流程處理，不會先行解鎖。
 
 ```bash
-vast-comfy --env-file .env instance stop    --instance <ID>
-vast-comfy --env-file .env instance destroy --instance <ID> --confirm-destroy
+vast-comfy --env-file .env instance stop    --instance <ID> --session-id <SID>
+vast-comfy --env-file .env instance destroy --instance <ID> --session-id <SID> --confirm-destroy
 ```
 
 - 程式結束、session 釋放、本機關機都不代表 instance 已停止或停止計費。
@@ -502,10 +506,10 @@ vast-comfy --env-file .env instance destroy --instance <ID> --confirm-destroy
 | 報價 | `vast-comfy offers search --alias <A>` / `offers best --alias <A>` |
 | 租用 | `vast-comfy rent create --alias <A> --offer-id <N> --label <L> --confirm-paid [--wait]` |
 | 查證建立 | `vast-comfy rent verify --label <L>` |
-| 實例 | `vast-comfy instance list` / `show` / `wait-ready` / `stop` / `destroy --confirm-destroy` / `logs` |
+| 實例 | `vast-comfy instance list` / `show` / `wait-ready` / `stop --session-id <SID>` / `destroy --confirm-destroy --session-id <SID>` / `logs` |
 | 連線 | `vast-comfy ssh info` / `ssh test` / `ssh tunnel --start|--stop` |
 | 金鑰 | `vast-comfy keys generate` / `register` / `list` |
-| 部署 | `vast-comfy deploy package --instance <ID>` |
+| 部署 | `vast-comfy deploy package --instance <ID> --session-id <SID>`（僅在本專案管理元件；取得獨占權後才部署） |
 | 鎖 | `vast-comfy session acquire` / `status` / `release` / `recover --accept-stale` |
 | 工作 | `vast-comfy jobs start` / `status` / `logs` / `wait` / `list` |
 | 安裝 | `vast-comfy install run` / `install verify` |

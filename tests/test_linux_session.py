@@ -191,7 +191,7 @@ def test_acquire_conflict_status_and_release(session_env):
     assert released["status"] == "released"
     assert session_env.lock_file().is_file()
 
-    rc6, after = session_env.run_json("status", "--session-id", "s1")
+    rc6, after, _ = session_env.run_json("status", "--session-id", "s1")
     assert after["lock_held"] is False
     assert after["matches_me"] is False
     assert session_env.owner()["state"] == "released"

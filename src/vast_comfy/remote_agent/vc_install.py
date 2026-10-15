@@ -30,8 +30,8 @@ import vc_common as C  # noqa: E402
 
 
 def _run_checked(argv: list[str]) -> int:
-    print(f"$ {' '.join(argv)}", flush=True)
-    return subprocess.call(argv)
+    print(f"$ {C.redact(' '.join(argv))}", flush=True)
+    return subprocess.call(argv, **C.child_process_options())
 
 
 def _curl_headers(entry: dict) -> list[str]:
@@ -145,7 +145,8 @@ def _download(entry: dict, *, timeout_note: str = "") -> dict:
 
 def _git(args: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess:
     return subprocess.run(
-        ["git", *args], cwd=str(cwd) if cwd else None, capture_output=True, text=True
+        ["git", *args], cwd=str(cwd) if cwd else None, capture_output=True, text=True,
+        **C.child_process_options(),
     )
 
 
@@ -220,8 +221,10 @@ def _install_manifest(manifest: dict) -> dict:
     models = []
     plugins = []
     for entry in manifest.get("models", []):
+        C.check_deadline()
         models.append(_download(entry))
     for entry in manifest.get("plugins", []):
+        C.check_deadline()
         plugins.append(_install_plugin(entry))
     changed = any(m["action"] == "downloaded" for m in models) or any(
         p["action"] == "installed" for p in plugins
@@ -307,7 +310,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv=None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
-    C.run_cli(args.func, args)
+    C.run_cli(args.func, args, guard=args.command == "run")
 
 
 if __name__ == "__main__":

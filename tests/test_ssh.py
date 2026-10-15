@@ -149,8 +149,10 @@ def test_tunnel_binds_localhost_only(tmp_path):
     assert argv[0] == "ssh"
     assert "-N" in argv
     assert "-L" in argv
-    assert "127.0.0.1:8188:localhost:18188" in argv
-    assert argv[-1] == "127.0.0.1:8188:localhost:18188"
+    assert argv[argv.index("-L") + 1] == "127.0.0.1:8188:localhost:18188"
+    # OpenSSH treats everything after the destination as a remote command, so
+    # the destination host must come last for the forward to actually happen.
+    assert argv[-1] == "root@ssh5.vast.ai"
 
 
 def test_execute_timeout_reports_command_may_still_be_running(tmp_path, monkeypatch):

@@ -212,14 +212,13 @@ def prepare_existing(
     if release_on_success is None:
         release_on_success = bool(cfg.get("session.release_on_success", True))
 
-    deploy = remote.deploy_package(runner, cfg)
-    lock = locks.acquire(runner, cfg, instance_id, session_id=session_id)
-    sid = lock["session_id"]
-
     manifest = build_install_manifest()
     assert_no_remote_credentials(manifest)
     models = build_models_payload(manifest)
     cases_doc = load_smoke_cases()
+    lock = locks.acquire(runner, cfg, instance_id, session_id=session_id)
+    sid = lock["session_id"]
+    deploy = remote.deploy_package(runner, cfg, session_id=sid)
     actual_run_id = run_id or new_run_id()
     seed = int(base_seed if base_seed is not None else cfg.get("smoke.seed", 12345))
 
@@ -250,6 +249,9 @@ def prepare_existing(
         actual_run_id,
         "--base-seed",
         str(seed),
+        "--comfy-url", f"http://localhost:{cfg.require('image.internal_port')}",
+        "--service", str(cfg.require("image.supervisor_service")),
+        "--wait-seconds", str(cfg.require("comfy.restart_wait_seconds")),
     ]
     if cases:
         argv += ["--cases", cases]

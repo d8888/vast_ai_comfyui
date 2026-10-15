@@ -33,6 +33,11 @@ def _job_dir(job_id: str) -> Path:
 
 
 def cmd_start(args) -> None:
+    with C.operation(args.session_id, label=args.name) as lease:
+        _start_job(args, lease)
+
+
+def _start_job(args, lease) -> None:
     C.ensure_dirs()
     owner = C.ensure_owns(args.session_id)
     if not args.argv:
@@ -58,6 +63,7 @@ def cmd_start(args) -> None:
     )
 
     env = dict(os.environ)
+    env["VAST_COMFY_JOB_DEADLINE"] = str(C.now_epoch() + args.timeout_seconds)
     for item in args.env or []:
         key, _, value = item.partition("=")
         if not key:
@@ -79,7 +85,7 @@ def cmd_start(args) -> None:
         log_fh.write(
             f"=== job {job_id} name={args.name} session={args.session_id} at {C.iso_utc()} ===\n".encode()
         )
-        log_fh.write(("$ " + " ".join(list(args.argv)) + "\n").encode())
+        log_fh.write(("$ " + C.redact(" ".join(list(args.argv))) + "\n").encode())
         log_fh.flush()
         proc = subprocess.Popen(
             runner,
@@ -89,7 +95,9 @@ def cmd_start(args) -> None:
             start_new_session=True,
             env=env,
             cwd=str(job_dir),
+            **C.child_process_options(),
         )
+    lease.handoff()
     meta["pid"] = proc.pid
     C.atomic_write_json(job_dir / "meta.json", meta)
     status = C.read_json(job_dir / "status.json", default={}) or {}
@@ -127,6 +135,7 @@ def cmd_run(args) -> None:  # internal runner (_run)
                     stdout=log_fh,
                     stderr=subprocess.STDOUT,
                     stdin=subprocess.DEVNULL,
+                    **C.child_process_options(),
                 )
             except FileNotFoundError as exc:
                 log_fh.write(f"\n[vast-comfy] command not found: {exc}\n".encode())
@@ -139,20 +148,19 @@ def cmd_run(args) -> None:  # internal runner (_run)
                 rc = proc.wait(timeout=args.timeout)
                 state = "succeeded" if rc == 0 else "failed"
             except subprocess.TimeoutExpired:
-                log_fh.write(f"\n[vast-comfy] job timeout after {args.timeout}s; terminating\n".encode())
+                log_fh.write(f"\n[vast-comfy] deadline exceeded after {args.timeout}s; work is NOT cancelled\n".encode())
                 log_fh.flush()
-                proc.terminate()
-                try:
-                    proc.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait()
-                rc = proc.returncode
+                status.update(state="overdue", job_may_still_be_running=True)
+                C.atomic_write_json(job_dir / "status.json", status)
+                rc = proc.wait()  # Retain the actual lock until work really ends.
                 state = "timeout"
             log_fh.write(f"\n[vast-comfy] job finished: state={state} exit_code={rc}\n".encode())
     finally:
         status.update({"state": state, "exit_code": rc, "ended_at": C.now_epoch()})
         C.atomic_write_json(job_dir / "status.json", status)
+        token = os.environ.get("VAST_COMFY_OPERATION_TOKEN")
+        if token:
+            C.finish_operation(token)
     sys.exit(0 if state == "succeeded" else 1)
 
 
@@ -167,7 +175,7 @@ def _load_job(job_id: str) -> tuple[Path, dict, dict]:
 
 def _effective_state(status: dict) -> str:
     state = str(status.get("state", "running"))
-    if state == "running":
+    if state in ("running", "overdue"):
         pid = status.get("pid")
         if pid and not C.pid_alive(pid):
             return "crashed"

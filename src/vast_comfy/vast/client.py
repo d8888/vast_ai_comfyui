@@ -239,12 +239,30 @@ class VastClient:
         )
 
     def stop_instance(self, instance_id: int | str) -> dict[str, Any]:
-        return self._do(
-            "PUT", f"/api/v0/instances/{instance_id}/", json_body={"state": "stopped"}, allow_retry=False
+        return self._action_result(
+            self._do(
+                "PUT", f"/api/v0/instances/{instance_id}/", json_body={"state": "stopped"}, allow_retry=False
+            ),
+            "stop",
+            instance_id,
         )
 
     def destroy_instance(self, instance_id: int | str) -> dict[str, Any]:
-        return self._do("DELETE", f"/api/v0/instances/{instance_id}/", json_body={}, allow_retry=False)
+        return self._action_result(
+            self._do("DELETE", f"/api/v0/instances/{instance_id}/", json_body={}, allow_retry=False),
+            "destroy",
+            instance_id,
+        )
+
+    @staticmethod
+    def _action_result(payload: Any, action: str, instance_id: int | str) -> dict[str, Any]:
+        if not isinstance(payload, dict) or payload.get("success") is not True:
+            raise VastComfyError(
+                code=E_UPSTREAM,
+                message=f"Vast.ai did not confirm {action}; the actual resource state must be checked.",
+                details={"instance_id": instance_id, "action": action, "api_message": scrub(str(payload))[:300]},
+            )
+        return payload
 
     # ------------------------------------------------------------------
     # ssh keys

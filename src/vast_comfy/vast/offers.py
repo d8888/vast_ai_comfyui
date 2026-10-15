@@ -14,10 +14,11 @@ Unit contracts (verified against the official OpenAPI schema and CLI source):
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from ..config import Config
-from ..errors import E_NO_OFFERS, E_PRICE_LIMIT, VastComfyError
+from ..errors import ConfigError, E_NO_OFFERS, E_PRICE_LIMIT, VastComfyError
 from ..gpu import AliasSpec
 
 # Numeric fields that must be present, correctly typed, for an offer to be
@@ -35,11 +36,12 @@ REQUIRED_NUMERIC_FIELDS = (
     "compute_cap",
     "cuda_max_good",
     "gpu_frac",
+    "disk_space",
 )
 
 
 def _is_number(value: Any) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
 def build_search_query(cfg: Config, spec: AliasSpec) -> dict[str, Any]:
@@ -76,6 +78,8 @@ def build_search_query(cfg: Config, spec: AliasSpec) -> dict[str, Any]:
         floor_mb = int(float(vram_floor_gb) * 1024)
         ram_min = max(ram_min or 0, floor_mb)
     ram_max: int | None = spec.gpu_ram_mb_max
+    if ram_min is not None and ram_max is not None and ram_min > ram_max:
+        raise ConfigError("Configured VRAM minimum contradicts the GPU alias maximum")
     if ram_min is not None or ram_max is not None:
         constraint: dict[str, Any] = {}
         if ram_min is not None:
@@ -130,11 +134,17 @@ def evaluate_offer(offer: dict[str, Any], cfg: Config, spec: AliasSpec) -> list[
     if offer.get("gpu_name") != spec.gpu_name:
         reasons.append(f"gpu_name {offer.get('gpu_name')!r} != alias gpu_name {spec.gpu_name!r}")
 
-    if "num_gpus" in numeric_ok and int(offer["num_gpus"]) != int(cfg.require("gpu.count")):
+    if "num_gpus" in numeric_ok and offer["num_gpus"] != int(cfg.require("gpu.count")):
         reasons.append(f"num_gpus {offer['num_gpus']} != required {cfg.require('gpu.count')} (exact match required)")
 
     if "gpu_frac" in numeric_ok and abs(float(offer["gpu_frac"]) - 1.0) > 1e-9:
         reasons.append(f"gpu_frac {offer['gpu_frac']} is a fractional GPU slice (full GPU required)")
+
+    if "id" in numeric_ok and (offer["id"] <= 0 or int(offer["id"]) != offer["id"]):
+        reasons.append("offer id must be a positive integer")
+
+    if "disk_space" in numeric_ok and offer["disk_space"] < cfg.require("storage.disk_gb"):
+        reasons.append("disk_space is below the requested allocated storage")
 
     if "gpu_ram" in numeric_ok:
         ram = float(offer["gpu_ram"])
@@ -205,11 +215,11 @@ def evaluate_offer(offer: dict[str, Any], cfg: Config, spec: AliasSpec) -> list[
         if not (verified is True or verification == "verified"):
             reasons.append("host is not verified")
 
-    if cfg.get("host.rentable", True) and offer.get("rentable") is False:
-        reasons.append("offer is not rentable")
+    if offer.get("rentable") is not True:
+        reasons.append("offer is not rentable or its rentable state is unknown")
 
-    if offer.get("rented") is True:
-        reasons.append("offer is currently rented by this account")
+    if offer.get("rented") is not False:
+        reasons.append("offer is currently rented or its rented state is unknown")
 
     country = _country_from_geolocation(offer.get("geolocation"))
     allow = cfg.get("host.geolocation_allow") or []
@@ -221,7 +231,9 @@ def evaluate_offer(offer: dict[str, Any], cfg: Config, spec: AliasSpec) -> list[
 
     if "dph_total" in numeric_ok:
         cap = float(cfg.require("pricing.max_dph_total_usd_per_hour"))
-        if float(offer["dph_total"]) > cap:
+        if offer["dph_total"] < 0:
+            reasons.append("dph_total must not be negative")
+        elif float(offer["dph_total"]) > cap:
             reasons.append(
                 f"dph_total ${offer['dph_total']}/h exceeds cap ${cap}/h (integrated price incl. disk)"
             )

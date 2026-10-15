@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import re
 import shlex
+import shutil
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
@@ -161,6 +163,105 @@ def classify_ssh_failure(stderr: str, rc: int) -> str:
     if any(p in lowered for p in _CONNECT_PATTERNS):
         return E_SSH_CONNECT
     return E_SSH_COMMAND
+
+
+def _public_identity(text: str) -> str | None:
+    fields = text.strip().split()
+    if len(fields) >= 2 and fields[0].startswith(("ssh-", "ecdsa-", "sk-")):
+        return " ".join(fields[:2])
+    return None
+
+
+def rental_preflight(client, cfg: Config) -> dict:
+    """Read-only local/key checks that must finish BEFORE paid creation.
+
+    A missing/unusable private key or an unregistered public key must never be
+    discovered only after the instance has already been billed.
+    """
+    for executable in ("ssh", "scp", "ssh-keygen"):
+        if not shutil.which(executable):
+            raise VastComfyError(
+                code=E_SSH_COMMAND,
+                message=f"Required local tool is missing: {executable}",
+                stage="preflight",
+            )
+    configured = cfg.resolved_paths()["key_path"]
+    if configured is not None and not configured.is_file():
+        raise VastComfyError(
+            code=E_KEY_MISSING,
+            message=f"SSH private key not found: {configured}",
+            stage="preflight",
+        )
+    agent_identities: set[str] = set()
+    if shutil.which("ssh-add"):
+        try:
+            result = subprocess.run(["ssh-add", "-L"], capture_output=True, text=True, timeout=10)
+            if result.returncode == 0:
+                agent_identities = {i for line in result.stdout.splitlines() if (i := _public_identity(line))}
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    identities: set[str] = set()
+    candidates = [configured] if configured else [Path.home() / ".ssh" / n for n in ("id_ed25519", "id_rsa")]
+    for private in candidates:
+        if not private.is_file():
+            continue
+        try:
+            result = subprocess.run(
+                ["ssh-keygen", "-y", "-P", "", "-f", str(private)],
+                capture_output=True, text=True, timeout=10, stdin=subprocess.DEVNULL,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise VastComfyError(
+                code=E_SSH_AUTH,
+                message="Cannot validate the SSH identity before paying.",
+                stage="preflight",
+            ) from exc
+        public = _public_identity(result.stdout) if result.returncode == 0 else None
+        if public:
+            identities.add(public)
+        else:
+            pubfile = Path(str(private) + ".pub")
+            supplied = _public_identity(pubfile.read_text(encoding="utf-8")) if pubfile.is_file() else None
+            if supplied in agent_identities:
+                identities.add(supplied)
+            elif configured:
+                raise VastComfyError(
+                    code=E_SSH_AUTH,
+                    message="Private key is locked or invalid; load it in ssh-agent before renting.",
+                    stage="preflight",
+                )
+    if not identities:
+        raise VastComfyError(
+            code=E_KEY_MISSING,
+            message="No usable SSH identity is available; nothing was rented.",
+            stage="preflight",
+        )
+    registered: set[str] = set()
+    for key in client.list_ssh_keys():
+        for field in ("ssh_key", "public_key", "key"):
+            identity = _public_identity(str(key.get(field, "")))
+            if identity:
+                registered.add(identity)
+    if not identities.intersection(registered):
+        raise VastComfyError(
+            code=E_SSH_AUTH,
+            message="No usable SSH public key is registered on this Vast.ai account; nothing was rented.",
+            stage="preflight",
+            hints=["Register the public key BEFORE creating the instance."],
+        )
+    return {"ssh_preflight_ok": True, "registered_identity_confirmed": True}
+
+
+def wait_for_ssh(runner, cfg: Config, *, clock=time.monotonic, sleep=time.sleep):
+    """Bounded readiness wait: an actual remote command must succeed."""
+    deadline = clock() + cfg.require("launch.ssh_ready_wait_minutes") * 60
+    while True:
+        try:
+            return runner.check_login()
+        except VastComfyError as exc:
+            if exc.code != E_SSH_CONNECT or clock() >= deadline:
+                raise
+            sleep(min(cfg.require("launch.poll_interval_seconds"), max(0, deadline - clock())))
 
 
 class SSHRunner:
@@ -330,12 +431,20 @@ class SSHRunner:
     # -- tunnel -----------------------------------------------------------
 
     def tunnel_argv(self, local_port: int, remote_port: int) -> list[str]:
-        """Local-only port forward (bound to 127.0.0.1)."""
+        """Local-only port forward (bound to 127.0.0.1); options precede the host.
+
+        OpenSSH treats everything after the destination as a remote command, so
+        ``-N``/``-L`` must come before ``user@host`` or no tunnel is created.
+        """
         return [
-            *ssh_base_args(self.ctx),
+            "ssh",
+            "-p",
+            str(self.ctx.port),
+            *_common_opts(self.ctx),
             "-N",
             "-L",
             f"127.0.0.1:{local_port}:localhost:{remote_port}",
+            f"{self.ctx.user}@{self.ctx.host}",
         ]
 
 

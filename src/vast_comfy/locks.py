@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import getpass
 import json
 import socket
@@ -11,7 +12,7 @@ import uuid
 
 from .config import Config
 from .errors import E_LOCK_NOT_HELD, VastComfyError
-from .remote import invoke
+from .remote import ensure_bootstrap, invoke
 from .ssh import SSHRunner
 
 
@@ -39,6 +40,7 @@ def acquire(
     by the operator (user-driven recovery).
     """
     sid = session_id or new_session_id()
+    ensure_bootstrap(runner, cfg)
     argv = [
         "acquire",
         "--session-id",
@@ -62,6 +64,7 @@ def acquire(
 
 
 def status(runner: SSHRunner, cfg: Config, *, session_id: str | None = None) -> dict:
+    ensure_bootstrap(runner, cfg)
     return invoke(
         runner,
         cfg,
@@ -72,6 +75,7 @@ def status(runner: SSHRunner, cfg: Config, *, session_id: str | None = None) -> 
 
 
 def release(runner: SSHRunner, cfg: Config, session_id: str, *, timeout_seconds: int = 90) -> dict:
+    ensure_bootstrap(runner, cfg)
     return invoke(
         runner,
         cfg,
@@ -112,3 +116,45 @@ def assert_owns(runner: SSHRunner, cfg: Config, session_id: str) -> dict:
             hints=["Acquire the session first (vast-comfy session acquire)."],
         )
     return payload
+
+
+class OperationHandle:
+    def __init__(self, token):
+        self.token, self.retained = token, False
+
+    def retain(self):
+        """Keep exclusion when stop/destroy is accepted and SSH will disappear."""
+        self.retained = True
+
+
+@contextlib.contextmanager
+def operation(runner: SSHRunner, cfg: Config, session_id: str, *, label: str = "operation"):
+    """Hold remote exclusion across multiple SSH/SCP or platform API calls."""
+    existing = getattr(runner, "_vast_operation_token", None)
+    if isinstance(existing, str):
+        assert_owns(runner, cfg, session_id)
+        yield OperationHandle(existing)
+        return
+    ensure_bootstrap(runner, cfg)
+    token = uuid.uuid4().hex
+    invoke(runner, cfg, "vc_session.py", ["begin-operation", "--session-id", session_id,
+           "--operation-token", token, "--label", label], timeout_seconds=60)
+    runner._vast_operation_token = token
+    handle = OperationHandle(token)
+    error = None
+    try:
+        yield handle
+    except BaseException as exc:
+        error = exc
+        raise
+    finally:
+        runner._vast_operation_token = None
+        if not handle.retained:
+            try:
+                invoke(runner, cfg, "vc_session.py", ["end-operation", "--session-id", session_id,
+                       "--operation-token", token], timeout_seconds=60)
+            except VastComfyError as exc:
+                if error is None:
+                    raise
+                if isinstance(error, VastComfyError):
+                    error.details["operation_release_error"] = exc.to_dict()

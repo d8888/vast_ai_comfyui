@@ -23,6 +23,7 @@ from ..errors import (
     VastComfyError,
 )
 from ..gpu import AliasSpec
+from ..ssh import rental_preflight
 from .client import VastClient, scrub
 from .offers import build_search_query, evaluate_offer, quote_from_offer
 
@@ -126,19 +127,25 @@ def create_instance(
             ],
         )
 
+    rental_preflight(client, cfg)
     body = build_create_body(cfg, label)
     try:
         response = client.create_instance(int(offer["id"]), body)
     except VastComfyError as exc:
-        if exc.code == E_NETWORK:
+        status_code = exc.details.get("status")
+        ambiguous = exc.code == E_NETWORK or (
+            exc.code == E_UPSTREAM and (status_code is None or status_code >= 500)
+        )
+        if ambiguous:
             raise VastComfyError(
                 code="E_CREATE_UNCERTAIN",
                 message=(
-                    "The create request outcome is UNKNOWN (network failure). "
+                    "The create request outcome is UNKNOWN (network or server failure). "
                     "It was NOT retried; the instance may or may not exist."
                 ),
                 stage="rent",
-                details={"offer_id": int(offer["id"]), "label": label},
+                details={"offer_id": int(offer["id"]), "label": label, "cause": exc.to_dict(),
+                         "since_epoch": time.time(), "instance_may_be_billing": True},
                 hints=[
                     f"Verify before doing anything else: vast-comfy rent verify --label {label!r}",
                     "Do NOT resend the create request blindly — that can double-charge.",

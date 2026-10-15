@@ -7,8 +7,9 @@ GPU is really used, and only reports READY when every required case produced a
 
 Anti-fake guarantees:
 
-* Every prompt is submitted with a per-run unique seed (recorded in the report),
-  so ComfyUI's node cache cannot satisfy the run with a previous result.
+* Every prompt uses a cryptographically random seed (recorded in the report),
+  and history must not report a cached sampler. Fixed-seed runs fail closed.
+* Case identities are checked against the actual output-to-sampler/model graph.
 * Every output image must have been modified after the case started.
 * A failure aborts the remaining cases and marks them ``not_run``; a partial or
   failed suite can never report READY.
@@ -18,7 +19,10 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
+import math
+import secrets
 import shutil
 import sys
 import time
@@ -36,6 +40,9 @@ except ImportError:  # pragma: no cover - exercised only on broken images
     Image = None
 
 SMOKE_CLIENT_ID = "vast-comfy-smoke"
+REQUIRED_CASE_IDS = ("base_t2i", "lllite_lineart", "lllite_inpaint", "turbo_t2i")
+MAX_SEED = (1 << 64) - 1
+LLLITE_NODE = "AnimaLLLiteApply_sdscripts"
 
 
 class CaseFailure(Exception):
@@ -46,33 +53,156 @@ class CaseFailure(Exception):
         self.details = details or {}
 
 
-def load_cases(cases_b64: str) -> list[dict]:
+def _positive_number(value) -> bool:
     try:
-        payload = json.loads(base64.b64decode(cases_b64).decode("utf-8"))
-    except (ValueError, json.JSONDecodeError) as exc:
-        C.fail("E_USAGE", f"invalid smoke cases payload: {exc}")
-    cases = payload.get("cases") if isinstance(payload, dict) else payload
+        return type(value) in (int, float) and math.isfinite(value) and value > 0
+    except OverflowError:
+        return False
+
+
+def _positive_int(value) -> bool:
+    return type(value) is int and value > 0
+
+
+def _relative_path(name, label: str) -> str:
+    if (
+        not isinstance(name, str)
+        or not name
+        or any(c in name for c in ("\\", ":", "\0"))
+        or any(part in ("", ".", "..") or part.startswith("~") for part in name.split("/"))
+    ):
+        raise CaseFailure("SMOKE_PATH", f"unsafe {label}: {name!r}")
+    return name
+
+
+def _contained_path(root: Path, name: str, label: str) -> Path:
+    path = root / _relative_path(name, label)
+    if not path.resolve().is_relative_to(root.resolve()):
+        raise CaseFailure("SMOKE_PATH", f"{label} escapes its directory: {name!r}")
+    return path
+
+
+def _input_asset_name(name) -> str:
+    _relative_path(name, "input asset path")
+    # LoadImage annotations can redirect a seemingly relative input to output
+    # or temp. Validate/copy the same file that ComfyUI will actually read.
+    if not name.lower().endswith(".png") or "[" in name or "]" in name:
+        raise CaseFailure("SMOKE_PATH", f"input must be an unannotated relative PNG path: {name!r}")
+    return name
+
+
+def _validate_value(value) -> None:
+    """Reject non-JSON/non-finite parameters, including nested override values."""
+    if isinstance(value, dict):
+        if any(not isinstance(key, str) for key in value):
+            raise CaseFailure("SMOKE_CONFIG", "parameter keys must be strings")
+        for item in value.values():
+            _validate_value(item)
+    elif isinstance(value, list):
+        for item in value:
+            _validate_value(item)
+    elif type(value) is float:
+        if not math.isfinite(value):
+            raise CaseFailure("SMOKE_CONFIG", "parameters must be finite")
+    elif value is not None and type(value) not in (str, int, bool):
+        raise CaseFailure("SMOKE_CONFIG", "parameters must be JSON values")
+
+
+def validate_cases(cases) -> list[dict]:
     if not isinstance(cases, list) or not cases:
-        C.fail("E_USAGE", "smoke cases payload must contain a non-empty 'cases' list")
+        raise CaseFailure("SMOKE_CONFIG", "smoke cases must be a non-empty list")
+    seen = set()
+    required = {"id", "workflow", "timeout_minutes", "overrides", "expect", "inputs"}
     for case in cases:
         if not isinstance(case, dict):
-            C.fail("E_USAGE", f"smoke case entry must be a mapping: {case!r}")
-        for key in ("id", "workflow", "timeout_minutes", "overrides", "expect", "inputs"):
-            if key not in case:
-                C.fail("E_USAGE", f"smoke case {case.get('id')!r} is missing key {key!r}")
+            raise CaseFailure("SMOKE_CONFIG", "smoke case entry must be a mapping")
+        if not required <= case.keys() or case.keys() - required - {"title"}:
+            raise CaseFailure("SMOKE_CONFIG", "smoke case has missing or unknown fields")
+        case_id = case["id"]
+        if not isinstance(case_id, str) or case_id not in REQUIRED_CASE_IDS or case_id in seen:
+            raise CaseFailure("SMOKE_CONFIG", f"unknown or duplicate smoke case id: {case_id!r}")
+        seen.add(case_id)
+        if "title" in case and not isinstance(case["title"], str):
+            raise CaseFailure("SMOKE_CONFIG", "case title must be a string")
+        workflow = _relative_path(case["workflow"], "workflow path")
+        if not workflow.endswith(".json"):
+            raise CaseFailure("SMOKE_CONFIG", "workflow must be an API JSON file")
+        timeout = case["timeout_minutes"]
+        if not _positive_number(timeout) or not _positive_number(timeout * 60):
+            raise CaseFailure("SMOKE_CONFIG", "timeout_minutes must be finite and positive")
+        expect = case["expect"]
+        if not isinstance(expect, dict) or set(expect) != {"width", "height"} or not all(
+            _positive_int(value) for value in expect.values()
+        ):
+            raise CaseFailure("SMOKE_CONFIG", "expect requires positive integer width and height")
+        inputs = case["inputs"]
+        if not isinstance(inputs, list):
+            raise CaseFailure("SMOKE_CONFIG", "case inputs must be a list")
+        for name in inputs:
+            _input_asset_name(name)
+        if len(set(inputs)) != len(inputs):
+            raise CaseFailure("SMOKE_CONFIG", "input asset names must be unique")
+        overrides = case["overrides"]
+        if not isinstance(overrides, dict) or any(
+            not isinstance(node_id, str) or not node_id or not isinstance(values, dict)
+            for node_id, values in overrides.items()
+        ):
+            raise CaseFailure("SMOKE_CONFIG", "overrides must map node ids to input mappings")
+        _validate_value(overrides)
+        for values in overrides.values():
+            for key, value in values.items():
+                if key in {"width", "height", "batch_size", "steps"} and not _positive_int(value):
+                    raise CaseFailure("SMOKE_CONFIG", f"{key} must be a positive integer")
+                if key in {"cfg", "strength", "denoise"} and not _positive_number(value):
+                    raise CaseFailure("SMOKE_CONFIG", f"{key} must be finite and positive")
+                if key == "seed" and value != "$run_seed" and not (
+                    type(value) is int and 0 <= value <= MAX_SEED
+                ):
+                    raise CaseFailure("SMOKE_CONFIG", "seed must be $run_seed or a uint64")
+    if len(cases) == 4 and tuple(case["id"] for case in cases) != REQUIRED_CASE_IDS:
+        raise CaseFailure("SMOKE_CONFIG", "the full smoke suite must use the required case order")
     return cases
+
+
+def load_cases(cases_b64: str) -> list[dict]:
+    try:
+        payload = json.loads(base64.b64decode(cases_b64, validate=True).decode("utf-8"))
+        if isinstance(payload, dict):
+            if type(payload.get("schema_version")) is not int or payload["schema_version"] != 1:
+                raise CaseFailure("SMOKE_CONFIG", "smoke cases require schema_version: 1")
+            if set(payload) != {"schema_version", "cases"}:
+                raise CaseFailure("SMOKE_CONFIG", "unknown smoke cases payload fields")
+            payload = payload["cases"]
+        return validate_cases(payload)
+    except (ValueError, TypeError, CaseFailure) as exc:
+        C.fail("E_USAGE", f"invalid smoke cases payload: {exc}")
 
 
 def compute_seed(base_seed: int, run_token: int, case_index: int, unique: bool) -> int:
     if not unique:
         return int(base_seed)
-    return int(base_seed) + (int(run_token) + case_index) % 1_000_000
+    # The token/clock alone is not entropy. Keep the configured base as an
+    # explicit input, but use all 64 random bits rather than a small time bucket.
+    return (secrets.randbits(64) + int(base_seed) + int(run_token) + case_index) & MAX_SEED
 
 
-def build_prompt(workflow_path: Path, overrides: dict, seed: int) -> dict:
+def build_prompt(
+    workflow_path: Path, overrides: dict, seed: int, *, workflow_bytes: bytes | None = None
+) -> dict:
     if not workflow_path.is_file():
         raise CaseFailure("SMOKE_WORKFLOW", f"workflow file not found: {workflow_path}")
-    prompt = json.loads(workflow_path.read_text(encoding="utf-8"))
+    try:
+        prompt = json.loads(workflow_bytes if workflow_bytes is not None else workflow_path.read_bytes())
+    except (ValueError, OSError) as exc:
+        raise CaseFailure("SMOKE_WORKFLOW", f"invalid workflow JSON: {workflow_path}: {exc}") from exc
+    if not isinstance(prompt, dict) or not prompt or any(
+        not isinstance(node, dict)
+        or not isinstance(node.get("class_type"), str)
+        or not isinstance(node.get("inputs"), dict)
+        for node in prompt.values()
+    ):
+        raise CaseFailure("SMOKE_WORKFLOW", "workflow must be a non-empty ComfyUI API graph")
+    _validate_value(prompt)
     for node_id, inputs in (overrides or {}).items():
         node = prompt.get(str(node_id))
         if not isinstance(node, dict):
@@ -86,6 +216,127 @@ def build_prompt(workflow_path: Path, overrides: dict, seed: int) -> dict:
                 value = int(seed)
             node["inputs"][key] = value
     return prompt
+
+
+def validate_graph(case: dict, prompt: dict, seed: int, assets_dir: Path) -> dict:
+    """Trace the *active* save/sampler/model path, not names or dangling nodes.
+
+    v1 accepts the shipped UNET/CLIP/VAE/KSampler graph and its explicit input
+    overrides, not arbitrary equivalent custom-node implementations.
+    """
+    def reject(message: str) -> None:
+        raise CaseFailure("SMOKE_WORKFLOW", f"{case['id']}: {message}")
+
+    def only(class_type: str) -> tuple[str, dict]:
+        found = [(key, node) for key, node in prompt.items() if node["class_type"] == class_type]
+        if len(found) != 1:
+            reject(f"requires exactly one {class_type}")
+        return found[0]
+
+    def linked(inputs: dict, key: str, class_type: str, slot: int = 0) -> tuple[str, dict]:
+        value = inputs.get(key)
+        if not (
+            isinstance(value, list) and len(value) == 2
+            and isinstance(value[0], str) and type(value[1]) is int and value[1] == slot
+            and value[0] in prompt and prompt[value[0]]["class_type"] == class_type
+        ):
+            reject(f"{key} must connect to {class_type} output {slot}")
+        return value[0], prompt[value[0]]["inputs"]
+
+    output_id, output = only("SaveImage")
+    _, decode = linked(output["inputs"], "images", "VAEDecode")
+    sampler_id, _ = only("KSampler")
+    connected_sampler, sampler = linked(decode, "samples", "KSampler")
+    if connected_sampler != sampler_id:
+        reject("SaveImage must use the required sampler")
+    _, vae = linked(decode, "vae", "VAELoader")
+    if vae.get("vae_name") != "qwen_image_vae.safetensors":
+        reject("requires the Qwen Image VAE")
+    for key in ("positive", "negative"):
+        _, conditioning = linked(sampler, key, "CLIPTextEncode")
+        _, clip = linked(conditioning, "clip", "CLIPLoader")
+        if clip.get("clip_name") != "qwen_3_06b_base.safetensors" or clip.get("device") == "cpu":
+            reject("requires the Qwen3 encoder on the default/GPU device")
+        if not isinstance(conditioning.get("text"), str) or not conditioning["text"].strip():
+            reject(f"{key} text must be non-empty")
+    latent_id, latent = linked(sampler, "latent_image", "EmptyLatentImage")
+    for key in ("width", "height"):
+        if not _positive_int(latent.get(key)) or latent[key] != case["expect"][key]:
+            reject(f"latent {key} must match the configured expectation")
+    if not _positive_int(latent.get("batch_size")):
+        reject("batch_size must be a positive integer")
+    if not _positive_int(sampler.get("steps")) or not _positive_number(sampler.get("cfg")):
+        reject("steps/CFG must be positive finite parameters")
+    if not _positive_number(sampler.get("denoise")) or sampler["denoise"] > 1:
+        reject("denoise must be in (0, 1]")
+    turbo = case["id"] == "turbo_t2i"
+    defaults = {"steps": 8 if turbo else 30, "cfg": 1.0 if turbo else 4.0, "denoise": 1.0}
+    for key, default in defaults.items():
+        if sampler[key] != case["overrides"].get(sampler_id, {}).get(key, default):
+            reject(f"{key} differs from the default without an explicit override")
+    if latent["batch_size"] != case["overrides"].get(latent_id, {}).get("batch_size", 1):
+        reject("batch_size differs from the default without an explicit override")
+    if type(sampler.get("seed")) is not int or sampler["seed"] != seed:
+        raise CaseFailure("SMOKE_CACHE", "the active KSampler must use $run_seed, not a fixed seed")
+
+    is_lllite = case["id"] in ("lllite_lineart", "lllite_inpaint")
+    if is_lllite:
+        plugin_id, _ = only(LLLITE_NODE)
+        connected_plugin, apply = linked(sampler, "model", LLLITE_NODE)
+        if plugin_id != connected_plugin:
+            reject("the sampler must use the LLLite-patched model")
+        weight = (
+            "anima-lllite-inpainting-v2.safetensors" if case["id"] == "lllite_inpaint"
+            else "anima-lllite-any-test-like-v2.safetensors"
+        )
+        if apply.get("lllite_name") != weight:
+            reject(f"requires LLLite weight {weight}")
+        if not _positive_number(apply.get("strength")):
+            reject("LLLite strength must be finite and positive")
+        start, end = apply.get("start_percent"), apply.get("end_percent")
+        if type(start) not in (int, float) or not _positive_number(end) or not 0 <= start < end <= 1:
+            reject("LLLite must be active for a non-empty sampling interval")
+        image_id, image = linked(apply, "image", "LoadImage")
+        name = image.get("image")
+        if name not in case["inputs"]:
+            reject("LLLite must use a declared bundled input image")
+        source = _contained_path(assets_dir, name, "input asset path")
+        if Image is None:
+            raise CaseFailure("SMOKE_PIL_MISSING", "Pillow is required to verify input images/masks")
+        try:
+            with Image.open(source) as img:
+                img.load()
+                if img.format != "PNG":
+                    reject("the bundled input must be PNG")
+                if case["id"] == "lllite_inpaint":
+                    mask_id, _ = linked(apply, "mask", "LoadImage", 1)
+                    if mask_id != image_id or "A" not in img.getbands():
+                        reject("inpainting mask must use the source image's alpha-mask output")
+                    low, high = img.getchannel("A").getextrema()
+                    if low == high:
+                        reject("inpainting requires a non-empty, non-full alpha mask")
+        except (OSError, ValueError) as exc:
+            raise CaseFailure("SMOKE_ASSET", f"invalid bundled input image: {source}: {exc}") from exc
+        _, model = linked(apply, "model", "UNETLoader")
+    else:
+        if any(node["class_type"] == LLLITE_NODE for node in prompt.values()):
+            reject("text-to-image cases must use the unpatched checkpoint")
+        _, model = linked(sampler, "model", "UNETLoader")
+    checkpoint = (
+        "anima-turbo-v1.1.safetensors" if case["id"] == "turbo_t2i"
+        else "anima-base-v1.0.safetensors"
+    )
+    if model.get("unet_name") != checkpoint:
+        reject(f"requires checkpoint {checkpoint}")
+    return {
+        "sampler_node_id": sampler_id,
+        "output_node_id": output_id,
+        "checkpoint": checkpoint,
+        "steps": sampler["steps"],
+        "cfg": sampler["cfg"],
+        "seed": seed,
+        **{key: latent[key] for key in ("width", "height", "batch_size")},
+    }
 
 
 def submit_prompt(base_url: str, prompt: dict) -> str:
@@ -118,32 +369,83 @@ def submit_prompt(base_url: str, prompt: dict) -> str:
 
 
 def wait_for_history(base_url: str, prompt_id: str, timeout_seconds: float) -> dict:
-    deadline = time.time() + timeout_seconds
-    while time.time() < deadline:
+    if not _positive_number(timeout_seconds):
+        raise CaseFailure("SMOKE_CONFIG", "history timeout must be finite and positive")
+    deadline = time.monotonic() + timeout_seconds
+    last_status = {}
+    while time.monotonic() < deadline:
         history = CM.http_json(f"{base_url}/history/{prompt_id}", timeout=20.0) or {}
+        if not isinstance(history, dict):
+            raise CaseFailure("SMOKE_HISTORY", "history must be a mapping")
         entry = history.get(prompt_id)
         if isinstance(entry, dict):
             status = entry.get("status") or {}
-            if status.get("completed"):
-                if status.get("status_str") == "success":
-                    return entry
+            if not isinstance(status, dict):
+                raise CaseFailure("SMOKE_HISTORY", "history status must be a mapping")
+            last_status = status
+            messages = status.get("messages") or []
+            if not isinstance(messages, list):
+                raise CaseFailure("SMOKE_HISTORY", "execution messages must be a list", {"status": status})
+            execution_error = any(
+                isinstance(message, (list, tuple)) and len(message) == 2
+                and message[0] in ("execution_error", "execution_interrupted")
+                for message in messages
+            )
+            if status.get("status_str") in ("error", "failed", "interrupted") or execution_error:
                 raise CaseFailure(
                     "SMOKE_EXEC_ERROR",
                     "ComfyUI reported an execution error for this case",
-                    {"status": status, "messages": status.get("messages", [])[-10:]},
+                    {"status": status, "messages": messages},
+                )
+            if status.get("completed") is True:
+                if status.get("status_str") == "success":
+                    return entry
+                raise CaseFailure(
+                    "SMOKE_EXEC_ERROR", "ComfyUI completed with a non-success status",
+                    {"status": status, "messages": messages},
                 )
         time.sleep(2.0)
     raise CaseFailure(
         "SMOKE_TIMEOUT",
         f"case did not finish within {timeout_seconds:.0f}s",
-        {"prompt_id": prompt_id, "note": "ComfyUI may still be executing; nothing was cancelled."},
+        {
+            "prompt_id": prompt_id, "status": last_status,
+            "messages": last_status.get("messages") or [],
+            "note": "ComfyUI may still be executing; nothing was cancelled.",
+        },
     )
 
 
-def collect_images(entry: dict, comfy_dir: Path) -> list[dict]:
+def reject_cached_samplers(entry: dict, prompt: dict) -> None:
+    sampler_ids = {key for key, node in prompt.items() if node["class_type"] == "KSampler"}
+    messages = (entry.get("status") or {}).get("messages") or []
+    if not isinstance(messages, list):
+        raise CaseFailure("SMOKE_HISTORY", "execution messages must be a list")
+    for message in messages:
+        if not isinstance(message, (list, tuple)) or len(message) != 2:
+            raise CaseFailure("SMOKE_HISTORY", "invalid execution message")
+        event, data = message
+        if event != "execution_cached":
+            continue
+        nodes = data.get("nodes") if isinstance(data, dict) else None
+        if not isinstance(nodes, list):
+            raise CaseFailure("SMOKE_HISTORY", "execution_cached has no valid node list")
+        cached = [str(node_id) for node_id in nodes if str(node_id) in sampler_ids or node_id == "KSampler"]
+        if cached:
+            raise CaseFailure(
+                "SMOKE_CACHE", "ComfyUI reused a cached KSampler; new SaveImage output is not proof of inference",
+                {"cached_samplers": cached, "messages": messages},
+            )
+
+
+def collect_images(
+    entry: dict, comfy_dir: Path, output_node_ids: set[str] | None = None
+) -> list[dict]:
     images: list[dict] = []
     outputs = entry.get("outputs") or {}
     for node_id, out in outputs.items():
+        if output_node_ids is not None and str(node_id) not in output_node_ids:
+            continue
         for image in (out or {}).get("images", []) or []:
             if image.get("type") != "output":
                 continue
@@ -151,7 +453,11 @@ def collect_images(entry: dict, comfy_dir: Path) -> list[dict]:
             filename = image.get("filename") or ""
             if not filename:
                 continue
-            path = comfy_dir / "output" / subfolder / filename
+            if "/" in filename or "\\" in filename:
+                raise CaseFailure("SMOKE_PATH", "output filename must not contain directories")
+            relative = f"{subfolder}/{filename}" if subfolder else filename
+            output_dir = _contained_path(comfy_dir, "output", "ComfyUI output directory")
+            path = _contained_path(output_dir, relative, "output image path")
             images.append(
                 {"filename": filename, "subfolder": subfolder, "node_id": str(node_id), "path": path}
             )
@@ -165,26 +471,32 @@ def validate_image(record: dict, expect: dict, case_start_epoch: float) -> dict:
     if not path.is_file():
         raise CaseFailure("SMOKE_IMAGE_MISSING", f"expected output image is missing: {path}")
     stat = path.stat()
-    if stat.st_mtime < case_start_epoch - 5.0:
-        raise CaseFailure(
-            "SMOKE_IMAGE_OLD",
-            "the output image predates this run; it is NOT accepted as new evidence",
-            {"path": str(path), "mtime": stat.st_mtime, "case_start": case_start_epoch},
-        )
     if Image is None:
         raise CaseFailure(
             "SMOKE_PIL_MISSING",
             "Pillow is unavailable on the instance; cannot decode/verify the PNG",
         )
+    if path.suffix.lower() != ".png":
+        raise CaseFailure("SMOKE_IMAGE_FORMAT", "the output must be a PNG file", {"path": str(path)})
     try:
         with Image.open(path) as img:
+            if img.format != "PNG":
+                raise CaseFailure("SMOKE_IMAGE_FORMAT", "the output is not PNG", {"path": str(path)})
             img.load()
             width, height = img.size
             rgb = img.convert("RGB")
             colors = rgb.getcolors(maxcolors=64)
+    except CaseFailure:
+        raise
     except Exception as exc:  # noqa: BLE001
         raise CaseFailure("SMOKE_IMAGE_DECODE", f"output image cannot be decoded: {exc}") from exc
 
+    if stat.st_mtime < case_start_epoch:
+        raise CaseFailure(
+            "SMOKE_IMAGE_OLD",
+            "the output image predates this run; it is NOT accepted as new evidence",
+            {"path": str(path), "mtime": stat.st_mtime, "case_start": case_start_epoch},
+        )
     expect_w = int(expect.get("width", 0))
     expect_h = int(expect.get("height", 0))
     if (expect_w and width != expect_w) or (expect_h and height != expect_h):
@@ -213,19 +525,31 @@ def validate_image(record: dict, expect: dict, case_start_epoch: float) -> dict:
 
 
 def ensure_input_assets(assets_dir: Path, comfy_dir: Path, case_inputs: list[str]) -> list[dict]:
-    input_dir = comfy_dir / "input"
+    input_dir = _contained_path(comfy_dir, "input", "ComfyUI input directory")
     input_dir.mkdir(parents=True, exist_ok=True)
     records = []
     for name in case_inputs:
-        src = assets_dir / name
+        _input_asset_name(name)
+        src = _contained_path(assets_dir, name, "bundled input path")
         if not src.is_file():
             raise CaseFailure("SMOKE_ASSET_MISSING", f"bundled test asset not found: {src}")
-        dst = input_dir / name
+        dst = _contained_path(input_dir, name, "ComfyUI input path")
         src_sha = C.sha256_file(src)
-        if dst.is_file() and C.sha256_file(dst) == src_sha:
-            records.append({"name": name, "action": "already_present", "sha256": src_sha})
-            continue
-        shutil.copy2(src, dst)
+        if dst.exists() or dst.is_symlink():
+            if dst.is_file() and C.sha256_file(dst) == src_sha:
+                records.append({"name": name, "action": "already_present", "sha256": src_sha})
+                continue
+            raise CaseFailure(
+                "SMOKE_ASSET_CONFLICT", "an existing ComfyUI input differs; it was NOT overwritten",
+                {"name": name, "path": str(dst), "expected_sha256": src_sha},
+            )
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            # Exclusive creation also protects a file appearing after the check.
+            with dst.open("xb") as target, src.open("rb") as source:
+                shutil.copyfileobj(source, target)
+        except FileExistsError as exc:
+            raise CaseFailure("SMOKE_ASSET_CONFLICT", f"input appeared during copy; not overwritten: {dst}") from exc
         if C.sha256_file(dst) != src_sha:
             raise CaseFailure("SMOKE_ASSET", f"copied asset checksum mismatch: {name}")
         records.append({"name": name, "action": "copied", "sha256": src_sha})
@@ -235,10 +559,10 @@ def ensure_input_assets(assets_dir: Path, comfy_dir: Path, case_inputs: list[str
 def required_nodes_from_workflows(workflows_dir: Path, workflow_names: list[str]) -> list[str]:
     nodes: set[str] = set()
     for name in workflow_names:
-        path = workflows_dir / name
+        path = _contained_path(workflows_dir, name, "workflow path")
         if not path.is_file():
             raise CaseFailure("SMOKE_WORKFLOW", f"workflow file not found: {path}")
-        prompt = json.loads(path.read_text(encoding="utf-8"))
+        prompt = build_prompt(path, {}, 0)
         for node in prompt.values():
             if isinstance(node, dict) and node.get("class_type"):
                 nodes.add(str(node["class_type"]))
@@ -327,8 +651,10 @@ def write_report(
         "input_assets": inputs,
         "cases": cases,
         "notes": [
-            "READY requires every required case to pass in this run.",
-            "Images are validated as new files with the expected size, decodable and not single-color.",
+            "READY requires exactly the four required cases, in order, to pass in this run.",
+            "Seeds contain 64 bits of secrets entropy; cached KSamplers and fixed-seed runs are rejected.",
+            "Images must be PNG, no older than their case start, the expected size and not single-color.",
+            "Queue checks before submission cannot exclude simultaneous submissions outside this tool.",
             "Artistic quality and LLLite control strength are for human review and are NOT pass criteria.",
         ],
     }
@@ -389,6 +715,40 @@ def run_suite(
         return result, exit_code
 
     # ---- preflight ----------------------------------------------------
+    prepared = []
+    try:
+        validate_cases(cases)  # Direct Python callers must not bypass payload validation.
+        if type(base_seed) is not int or not 0 <= base_seed <= MAX_SEED or type(run_token) is not int:
+            raise CaseFailure("SMOKE_CONFIG", "base_seed must be uint64 and run_token must be an integer")
+        if unique_seed is not True:
+            raise CaseFailure(
+                "SMOKE_CACHE",
+                "fixed-seed smoke is unsupported until safe execution-cache invalidation is implemented; "
+                "no inference was submitted and no service was restarted",
+            )
+        used_seeds = set()
+        for index, case in enumerate(cases):
+            seed = compute_seed(base_seed, run_token, index, True)
+            if seed in used_seeds:
+                raise CaseFailure("SMOKE_CACHE", "random seed collision; refusing to reuse a sampler seed")
+            used_seeds.add(seed)
+            path = _contained_path(workflows_dir, case["workflow"], "workflow path")
+            if not path.is_file():
+                raise CaseFailure("SMOKE_WORKFLOW", f"workflow file not found: {path}")
+            # Hash and parse the same snapshot, then retain it until submission.
+            raw = path.read_bytes()
+            prompt = build_prompt(path, case["overrides"], seed, workflow_bytes=raw)
+            settings = validate_graph(case, prompt, seed, assets_dir)
+            prepared.append({
+                "prompt": prompt, "seed": seed, "settings": settings,
+                "workflow_sha256": hashlib.sha256(raw).hexdigest(),
+            })
+    except (CaseFailure, OSError) as exc:
+        return early({
+            "ok": False, "code": "E_CONFIG", "reason": getattr(exc, "reason", "SMOKE_WORKFLOW"),
+            "message": str(exc), "details": getattr(exc, "details", {}),
+        }, 1)
+
     CM.check_health(base_url)
     gpu = CM.gpu_check()
     queue = CM.queue_snapshot(base_url)
@@ -403,8 +763,9 @@ def run_suite(
             13,
         )
     health = CM.check_health(base_url)
-    workflow_names = [str(c["workflow"]) for c in cases]
-    nodes_checked = required_nodes_from_workflows(workflows_dir, workflow_names)
+    nodes_checked = sorted({
+        node["class_type"] for item in prepared for node in item["prompt"].values()
+    })
     object_info = CM.http_json(f"{base_url}/object_info", timeout=60.0) or {}
     missing = [n for n in nodes_checked if n not in object_info]
     if require_plugin_node and "AnimaLLLiteApply_sdscripts" not in object_info:
@@ -435,27 +796,51 @@ def run_suite(
     # ---- run cases ------------------------------------------------------
     results: list[dict] = []
     overall_ok = True
-    for index, case in enumerate(cases):
+    for case, item in zip(cases, prepared):
         if not overall_ok:
             results.append(
                 {
                     "id": case["id"],
                     "status": "not_run",
+                    "workflow": case["workflow"], "workflow_sha256": item["workflow_sha256"],
+                    "effective_prompt": item["prompt"], "effective_settings": item["settings"],
+                    "execution_messages": [],
                     "reason": "previous case failed; the flow stops explicitly and never skips ahead",
                 }
             )
             continue
         case_start = C.now_epoch()
-        seed = compute_seed(base_seed, run_token, index, unique_seed)
-        record: dict = {"id": case["id"], "seed": seed, "started_at": case_start}
+        seed = item["seed"]
+        prompt = item["prompt"]
+        record: dict = {
+            "id": case["id"], "seed": seed, "started_at": case_start,
+            "workflow": case["workflow"], "workflow_sha256": item["workflow_sha256"],
+            "effective_prompt": prompt, "effective_settings": item["settings"],
+            "timeout_minutes": case["timeout_minutes"], "expect": case["expect"],
+            "execution_messages": [],
+        }
         try:
-            prompt = build_prompt(workflows_dir / str(case["workflow"]), case.get("overrides", {}), seed)
+            # A UI upload may have changed an input since suite preflight. Never
+            # repair it by overwriting; recheck the actual image/mask being used.
+            record["input_assets"] = ensure_input_assets(assets_dir, comfy_dir, case["inputs"])
+            validate_graph(case, prompt, seed, comfy_dir / "input")
+            queue = CM.queue_snapshot(base_url)
+            if queue["busy"]:
+                raise CaseFailure(
+                    "E_COMFY_BUSY", "ComfyUI became busy; refusing to insert the next smoke case",
+                    {"queue": queue},
+                )
             prompt_id = submit_prompt(base_url, prompt)
             record["prompt_id"] = prompt_id
-            timeout_seconds = float(case.get("timeout_minutes", 15)) * 60.0
+            timeout_seconds = float(case["timeout_minutes"]) * 60.0
             entry = wait_for_history(base_url, prompt_id, timeout_seconds)
-            images = collect_images(entry, comfy_dir)
+            record["history_status"] = entry.get("status") or {}
+            record["execution_messages"] = record["history_status"].get("messages") or []
+            reject_cached_samplers(entry, prompt)
+            images = collect_images(entry, comfy_dir, {item["settings"]["output_node_id"]})
             validated = [validate_image(img, case.get("expect", {}), case_start) for img in images]
+            if len(validated) != item["settings"]["batch_size"]:
+                raise CaseFailure("SMOKE_IMAGE_COUNT", "output count does not match the configured batch_size")
             record.update(
                 {
                     "status": "passed",
@@ -465,6 +850,10 @@ def run_suite(
             )
         except CaseFailure as exc:
             overall_ok = False
+            if "messages" in exc.details:
+                record["execution_messages"] = exc.details["messages"]
+            if "status" in exc.details:
+                record["history_status"] = exc.details["status"]
             record.update(
                 {
                     "status": "failed",
@@ -486,9 +875,9 @@ def run_suite(
         results.append(record)
 
     # ---- verdict & report ----------------------------------------------
-    requested_all = len(cases) == 4 and all(
-        c.get("id") in {r["id"] for r in results} for c in cases
-    )
+    requested_all = tuple(c["id"] for c in cases) == REQUIRED_CASE_IDS and tuple(
+        r["id"] for r in results if r["status"] == "passed"
+    ) == REQUIRED_CASE_IDS
     any_failed = any(r["status"] == "failed" for r in results)
     verdict = "READY" if (overall_ok and requested_all) else ("FAILED" if any_failed else "PARTIAL")
 
@@ -522,8 +911,11 @@ def run_suite(
             {"id": r["id"], "status": r["status"], "seed": r.get("seed")} for r in results
         ],
     }
+    became_busy = any(r.get("reason") == "E_COMFY_BUSY" for r in results)
+    if became_busy:
+        result["code"] = "E_COMFY_BUSY"
     C.atomic_write_json(run_dir / "summary.json", result)
-    return result, (0 if verdict in ("READY", "PARTIAL") else 5)
+    return result, (13 if became_busy else (0 if verdict in ("READY", "PARTIAL") else 5))
 
 
 # ---------------------------------------------------------------------------
@@ -547,8 +939,8 @@ def cmd_run(args) -> None:
         except (ValueError, json.JSONDecodeError) as exc:
             C.fail("E_USAGE", f"invalid models payload: {exc}")
 
-    run_token = int(args.run_token) if args.run_token else int(C.now_epoch())
-    run_id = args.run_id or time.strftime("%Y%m%d-%H%M%S", time.gmtime()) + "-" + f"{run_token % 4096:03x}"
+    run_token = int(args.run_token) if args.run_token else secrets.randbits(64)
+    run_id = args.run_id or time.strftime("%Y%m%d-%H%M%S", time.gmtime()) + "-" + f"{run_token:016x}"
 
     result, exit_code = run_suite(
         session_id=args.session_id,

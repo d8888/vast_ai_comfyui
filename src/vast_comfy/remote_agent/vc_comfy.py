@@ -106,7 +106,17 @@ def wait_api_up(base_url: str, timeout_seconds: float, poll_seconds: float = 3.0
 def restart_service(args) -> dict:
     C.ensure_owns(args.session_id)
     base = comfy_base(args)
-    snapshot = queue_snapshot(base)
+    state_before = service_state(args.service)
+    try:
+        snapshot = queue_snapshot(base)
+    except (OSError, ValueError):
+        # A stopped service has no HTTP API. Never restart a RUNNING service
+        # when we cannot determine whether it has active work.
+        if state_before["running"] or not any(
+            marker in state_before["raw"] for marker in ("STOPPED", "EXITED", "FATAL", "BACKOFF")
+        ):
+            C.fail("E_COMFY_UNAVAILABLE", "Cannot safely determine the queue state of a running service.")
+        snapshot = {"busy": False, "running": 0, "pending": 0}
     if snapshot["busy"]:
         C.fail(
             "E_COMFY_BUSY",
@@ -114,7 +124,6 @@ def restart_service(args) -> dict:
             exit_code=13,
             queue=snapshot,
         )
-    state_before = service_state(args.service)
     rc = subprocess.call(["supervisorctl", "restart", args.service])
     if rc != 0:
         C.fail(
@@ -286,6 +295,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("logs")
     p.add_argument("--session-id", required=True)
     p.add_argument("--tail", type=int, default=200)
+    add_common(p)
     p.set_defaults(func=cmd_logs)
 
     return parser
@@ -294,7 +304,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv=None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
-    C.run_cli(args.func, args)
+    C.run_cli(args.func, args, guard=args.command == "restart")
 
 
 if __name__ == "__main__":

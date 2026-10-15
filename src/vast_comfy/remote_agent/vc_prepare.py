@@ -41,14 +41,18 @@ def cmd_run(args) -> dict:
             C.fail("E_USAGE", f"invalid install manifest: {exc}")
         install_result = INS._install_manifest(manifest)
         summary["steps"]["install"] = install_result
+        C.check_deadline()
 
         base = CM.comfy_base(args)
         api_ok = True
         try:
             CM.check_health(base)
-        except C.RemoteFail as exc:
+        except (C.RemoteFail, OSError) as exc:
             api_ok = False
-            summary["steps"]["initial_health_error"] = {"code": exc.code, "message": exc.message}
+            summary["steps"]["initial_health_error"] = {
+                "code": getattr(exc, "code", "E_COMFY_UNAVAILABLE"),
+                "message": C.redact(str(exc)),
+            }
 
         if install_result.get("changed") or not api_ok:
             if api_ok:
@@ -165,7 +169,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv=None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
-    C.run_cli(args.func, args)
+    C.run_cli(args.func, args, guard=True)
 
 
 if __name__ == "__main__":

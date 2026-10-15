@@ -16,8 +16,9 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import uuid
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from .config import Config
 from .errors import E_DEPLOY, E_INTERNAL, VastComfyError
@@ -39,13 +40,18 @@ _FORBIDDEN_NAME_PATTERNS = [
 
 
 def package_files() -> list[tuple[Path, str]]:
-    """The explicit whitelist of auto-uploaded files: (local_path, remote_rel)."""
+    """The explicit whitelist of auto-uploaded files: (local_path, remote_rel).
+
+    File names are listed explicitly; no directory scan may ever widen the
+    package, so a stray user file can never enter it.
+    """
     root = find_repo_root()
     files: list[tuple[Path, str]] = []
 
     agent_dir = Path(__file__).resolve().parent / "remote_agent"
-    for path in sorted(agent_dir.glob("*.py")):
-        files.append((path, f"remote/{path.name}"))
+    for name in ("vc_common.py", "vc_session.py", "vc_jobs.py", "vc_install.py",
+                 "vc_comfy.py", "vc_smoke.py", "vc_prepare.py"):
+        files.append((agent_dir / name, f"remote/{name}"))
 
     for sub in ("api", "gui"):
         workflow_dir = root / "workflows" / sub
@@ -55,15 +61,18 @@ def package_files() -> list[tuple[Path, str]]:
                 message=f"Missing workflow directory: {workflow_dir}",
                 stage="deploy",
             )
-        for path in sorted(workflow_dir.glob("*.json")):
+        extension = ".api.json" if sub == "api" else ".json"
+        for stem in ("anima_base_t2i", "anima_base_lllite_lineart",
+                     "anima_base_lllite_inpaint", "anima_turbo_t2i"):
+            path = workflow_dir / f"{stem}{extension}"
             files.append((path, f"workflows/{sub}/{path.name}"))
 
     smoke_dir = root / "assets" / "smoke"
     if not smoke_dir.is_dir():
         raise VastComfyError(code=E_DEPLOY, message=f"Missing assets directory: {smoke_dir}", stage="deploy")
-    for path in sorted(smoke_dir.iterdir()):
-        if path.is_file() and path.suffix.lower() in (".png", ".yaml", ".md"):
-            files.append((path, f"assets/smoke/{path.name}"))
+    for name in ("README.md", "smoke_cases.yaml",
+                 "vast_comfy_smoke_control.png", "vast_comfy_smoke_inpaint_src.png"):
+        files.append((smoke_dir / name, f"assets/smoke/{name}"))
 
     return files
 
@@ -137,8 +146,63 @@ def current_link(cfg: Config) -> str:
     return f"{runtime_root(cfg)}/current"
 
 
-def deploy_package(runner: SSHRunner, cfg: Config, *, force: bool = False) -> dict:
-    """Upload (idempotently) and verify the management package."""
+def bootstrap_files() -> list[Path]:
+    directory = Path(__file__).resolve().parent / "remote_agent"
+    return [directory / "vc_common.py", directory / "vc_session.py"]
+
+
+def bootstrap_dir(cfg: Config) -> str:
+    digest = hashlib.sha256("".join(_sha256(p) for p in bootstrap_files()).encode()).hexdigest()[:16]
+    return f"{runtime_root(cfg)}/bootstrap/{digest}"
+
+
+def remote_environment(cfg: Config, runner=None) -> list[str]:
+    env = ["env", f"VAST_COMFY_RUNTIME_DIR={runtime_root(cfg)}",
+           f"VAST_COMFY_COMFY_DIR={cfg.require('image.comfyui_dir')}"]
+    token = getattr(runner, "_vast_operation_token", None) if runner is not None else None
+    if isinstance(token, str):
+        env += [f"VAST_COMFY_OPERATION_TOKEN={token}"]
+    return env
+
+
+def ensure_bootstrap(runner: SSHRunner, cfg: Config) -> str:
+    """Only the immutable lock runtime may be uploaded before ownership.
+
+    Never touch the full package or the global current link here: a conflicting
+    agent can bootstrap or inspect the lock, but it cannot change deployed code.
+    """
+    target = bootstrap_dir(cfg)
+    py = cfg.require("image.venv_python")
+    manifest = {p.name: _sha256(p) for p in bootstrap_files()}
+    verifier = ("import hashlib,json,pathlib,sys; p=pathlib.Path(sys.argv[1]); "
+                "m=json.loads(sys.argv[2]); "
+                "sys.exit(0 if all((p/n).is_file() and hashlib.sha256((p/n).read_bytes()).hexdigest()==s "
+                "for n,s in m.items()) else 1)")
+    check = [py, "-c", verifier, target, json.dumps(manifest)]
+    if runner.run_remote(check, check=False).rc == 0:
+        return target
+    staging = target + ".staging-" + uuid.uuid4().hex
+    runner.run_remote(["mkdir", "-p", staging], check=True)
+    for path in bootstrap_files():
+        runner.upload(path, f"{staging}/{path.name}")
+    runner.run_remote([py, "-c", verifier, staging, json.dumps(manifest)], check=True)
+    runner.run_remote(["mv", "-T", "-n", staging, target], check=True)
+    runner.run_remote(check, check=True)
+    return target
+
+
+def deploy_package(runner: SSHRunner, cfg: Config, *, session_id: str, force: bool = False) -> dict:
+    """Upload (idempotently) and verify the management package.
+
+    Requires live session ownership first: the package deployment must itself
+    be an exclusive operation (bootstrap may only create the lock runtime).
+    """
+    from .locks import operation
+    with operation(runner, cfg, session_id, label="deploy"):
+        return _deploy_package(runner, cfg, force=force)
+
+
+def _deploy_package(runner: SSHRunner, cfg: Config, *, force: bool = False) -> dict:
     info = build_package()
     remote_pkg = package_dir(cfg, info.package_hash)
     venv_python = str(cfg.require("image.venv_python"))
@@ -175,7 +239,7 @@ def deploy_package(runner: SSHRunner, cfg: Config, *, force: bool = False) -> di
         with tempfile.TemporaryDirectory(prefix="vast-comfy-pkg-") as tmp:
             tmp_dir = Path(tmp)
             for record in info.records:
-                rel_parent = f"{remote_pkg}/{Path(record['rel']).parent}"
+                rel_parent = f"{remote_pkg}/{PurePosixPath(record['rel']).parent}"
                 runner.run_remote(["mkdir", "-p", rel_parent], check=True)
                 runner.upload(record["local"], f"{remote_pkg}/{record['rel']}")
                 uploaded += 1
@@ -213,7 +277,9 @@ def deploy_package(runner: SSHRunner, cfg: Config, *, force: bool = False) -> di
             )
 
     # Point `current` at the verified package (atomic symlink swap).
-    runner.run_remote(["ln", "-sfn", remote_pkg, current_link(cfg)], check=True)
+    temporary_link = current_link(cfg) + ".new-" + uuid.uuid4().hex
+    runner.run_remote(["ln", "-s", remote_pkg, temporary_link], check=True)
+    runner.run_remote(["mv", "-T", temporary_link, current_link(cfg)], check=True)
 
     return {
         "package_hash": info.package_hash,
@@ -240,10 +306,15 @@ def invoke(
     back into a structured :class:`VastComfyError` with the remote code.
     """
     venv_python = str(cfg.require("image.venv_python"))
-    tool_path = f"{current_link(cfg)}/remote/{tool}"
+    tool_path = (
+        f"{bootstrap_dir(cfg)}/{tool}" if tool == "vc_session.py"
+        else f"{current_link(cfg)}/remote/{tool}"
+    )
     _validate_tool_name(tool)
     result = runner.run_remote(
-        [venv_python, tool_path, *argv], timeout_seconds=timeout_seconds, check=False
+        [*remote_environment(cfg, runner), venv_python, tool_path, *argv],
+        timeout_seconds=timeout_seconds,
+        check=False,
     )
     payload: dict | None = None
     for line in reversed(result.stdout.strip().splitlines()):

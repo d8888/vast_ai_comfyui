@@ -80,6 +80,8 @@ def wait(
         state = str(last.get("state"))
         if state in _TERMINAL_STATES:
             return last
+        if state == "overdue":
+            raise JobTimeoutError(job_id, timeout_seconds, details={"last_status": last})
         if clock() >= deadline:
             raise JobTimeoutError(job_id, timeout_seconds, details={"last_status": last})
         sleep(poll)

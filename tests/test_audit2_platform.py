@@ -237,4 +237,81 @@ def test_explicit_release_failure_is_not_reported_as_overall_success(cfg, monkey
     assert error.value.code == "E_LOCK_JOBS_RUNNING"
     assert details["verdict"] == "READY"
     assert details["release_error"]["code"] == "E_LOCK_JOBS_RUNNING"
+    assert details["release_outcome"] == "not_released"
     assert "NOT released" in details["lock_state"]
+
+
+def test_unknown_release_outcome_is_not_reported_as_still_held(cfg, monkeypatch):
+    monkeypatch.setattr(prepare.locks, "acquire", lambda *a, **k: {"session_id": "S"})
+    monkeypatch.setattr(prepare.remote, "deploy_package", lambda *a, **k: {})
+    monkeypatch.setattr(prepare.jobs, "start", lambda *a, **k: {"job_id": "J"})
+    monkeypatch.setattr(prepare.jobs, "wait", lambda *a, **k: {"state": "succeeded"})
+    monkeypatch.setattr(prepare.remote, "read_remote_json", lambda *a: {"verdict": "READY"})
+
+    def lost_reply(*a, **k):
+        raise VastComfyError("E_NETWORK", "release reply lost after completion")
+
+    monkeypatch.setattr(prepare.locks, "release", lost_reply)
+    with pytest.raises(VastComfyError) as error:
+        prepare.prepare_existing(Mock(), cfg, instance_id=123, release_on_success=True)
+    details = error.value.details
+    assert details["release_outcome"] == "unknown"
+    assert "UNKNOWN" in details["lock_state"]
+    assert details["verdict"] == "READY"
+    assert any("session status" in hint for hint in error.value.hints)
+
+
+def test_release_not_held_is_reported_distinctly(cfg, monkeypatch):
+    monkeypatch.setattr(prepare.locks, "acquire", lambda *a, **k: {"session_id": "S"})
+    monkeypatch.setattr(prepare.remote, "deploy_package", lambda *a, **k: {})
+    monkeypatch.setattr(prepare.jobs, "start", lambda *a, **k: {"job_id": "J"})
+    monkeypatch.setattr(prepare.jobs, "wait", lambda *a, **k: {"state": "succeeded"})
+    monkeypatch.setattr(prepare.remote, "read_remote_json", lambda *a: {"verdict": "READY"})
+
+    def other_owner(*a, **k):
+        raise VastComfyError("E_LOCK_NOT_HELD", "This session does not own the remote lock",
+                             details={"owner": {"session_id": "other"}})
+
+    monkeypatch.setattr(prepare.locks, "release", other_owner)
+    with pytest.raises(VastComfyError) as error:
+        prepare.prepare_existing(Mock(), cfg, instance_id=123, release_on_success=True)
+    details = error.value.details
+    assert details["release_outcome"] == "not_held"
+    assert "no longer owns" in details["lock_state"]
+    assert details["owner"] == {"session_id": "other"}
+
+
+def test_prepare_summary_read_failure_keeps_handoff_details(cfg, monkeypatch):
+    monkeypatch.setattr(prepare.locks, "acquire", lambda *a, **k: {"session_id": "auto-sid"})
+    monkeypatch.setattr(prepare.remote, "deploy_package", lambda *a, **k: {})
+    monkeypatch.setattr(prepare.jobs, "start", lambda *a, **k: {"job_id": "job-77"})
+    monkeypatch.setattr(prepare.jobs, "wait", lambda *a, **k: {"state": "succeeded"})
+
+    def lost(*a, **k):
+        raise VastComfyError("E_SSH_CONNECT", "summary response lost")
+
+    monkeypatch.setattr(prepare.remote, "read_remote_json", lost)
+    with pytest.raises(VastComfyError) as error:
+        prepare.prepare_existing(Mock(), cfg, instance_id=123, run_id="run-summary")
+    details = error.value.details
+    assert error.value.code == "E_SSH_CONNECT"
+    assert details["session_id"] == "auto-sid"
+    assert details["job_id"] == "job-77"
+    assert details["run_id"] == "run-summary"
+    assert "still held" in details["lock_state"]
+    assert "continues to run" in details["instance_billing"]
+
+
+def test_prepare_dispatches_the_configured_install_stage_timeout(cfg, monkeypatch):
+    cfg = load_config(set_overrides={"jobs.install_timeout_minutes": 2})
+    monkeypatch.setattr(prepare.locks, "acquire", lambda *a, **k: {"session_id": "S"})
+    monkeypatch.setattr(prepare.remote, "deploy_package", lambda *a, **k: {})
+    start = Mock(return_value={"job_id": "J"})
+    monkeypatch.setattr(prepare.jobs, "start", start)
+    monkeypatch.setattr(prepare.jobs, "wait", lambda *a, **k: {"state": "succeeded"})
+    monkeypatch.setattr(prepare.remote, "read_remote_json", lambda *a: {"verdict": "READY"})
+
+    prepare.prepare_existing(Mock(), cfg, instance_id=123, release_on_success=False,
+                             run_id="run-install-cap")
+    command = start.call_args.args[4]
+    assert float(command[command.index("--install-timeout-seconds") + 1]) == 120.0

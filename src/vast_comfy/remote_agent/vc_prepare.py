@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import math
 import os
 import sys
 from pathlib import Path
@@ -42,7 +43,11 @@ def cmd_run(args) -> dict:
             manifest = json.loads(base64.b64decode(args.install_manifest_b64).decode("utf-8"))
         except (ValueError, json.JSONDecodeError) as exc:
             C.fail("E_USAGE", f"invalid install manifest: {exc}")
-        install_result = INS._install_manifest(manifest)
+        install_timeout = float(args.install_timeout_seconds or 0.0)
+        if not math.isfinite(install_timeout) or install_timeout < 0:
+            C.fail("E_USAGE", "install timeout must be a finite non-negative number")
+        install_deadline = C.now_epoch() + install_timeout if install_timeout > 0 else None
+        install_result = INS._install_manifest(manifest, deadline=install_deadline)
         summary["steps"]["install"] = install_result
         C.check_deadline()
 
@@ -162,6 +167,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--wait-seconds", type=float, default=240.0)
     p.add_argument("--run-id", required=True)
     p.add_argument("--run-token", default="")
+    p.add_argument("--install-timeout-seconds", type=float, default=0.0)
     p.add_argument("--base-seed", type=int, default=12345)
     p.add_argument("--fixed-seed", action="store_true")
     p.add_argument("--verify-model-shas", action="store_true")

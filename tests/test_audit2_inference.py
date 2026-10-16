@@ -408,3 +408,77 @@ def test_resolve_inference_preserves_and_replaces_unreadable_records(remote_agen
     record = common.read_json(common.INFERENCE_DIR / "corrupt.json")
     assert record["state"] == "rejected" and record["replaced_unreadable_record"] == archived
     assert not common.pending_inferences()
+
+
+@pytest.mark.parametrize("invalid", [[], "text", 7.5, {"state": "running"}])
+def test_resolve_inference_replaces_schema_invalid_records(remote_agent, monkeypatch, invalid):
+    common = remote_agent.C
+    session = importlib.import_module("vc_session")
+    common.INFERENCE_DIR.mkdir(parents=True, exist_ok=True)
+    (common.INFERENCE_DIR / "odd.json").write_text(json.dumps(invalid))
+    with pytest.raises(common.RemoteFail) as error:
+        session.cmd_resolve_inference(SimpleNamespace(intent_id="odd", confirm_verified=False, note=""))
+    assert error.value.code == "E_APPROVAL_REQUIRED"
+    output = Mock(); monkeypatch.setattr(common, "emit", output)
+    session.cmd_resolve_inference(SimpleNamespace(intent_id="odd", confirm_verified=True, note=""))
+    payload = output.call_args.args[0]
+    archived = payload["replaced_unreadable_record"]
+    assert (common.INFERENCE_DIR / archived).read_text() == json.dumps(invalid)
+    record = common.read_json(common.INFERENCE_DIR / "odd.json")
+    assert record["intent_id"] == "odd" and record["state"] == "rejected"
+    assert not common.pending_inferences()
+
+
+def test_resolve_inference_handles_non_utf8_records_without_crashing(remote_agent, monkeypatch):
+    common = remote_agent.C
+    session = importlib.import_module("vc_session")
+    common.INFERENCE_DIR.mkdir(parents=True, exist_ok=True)
+    (common.INFERENCE_DIR / "binary.json").write_bytes(b"\xff\xfe\x00")
+    # The fence itself must stay readable (fail closed, not E_INTERNAL).
+    assert common.pending_inferences()[0]["record_unreadable"] is True
+    with pytest.raises(common.RemoteFail):
+        session.cmd_resolve_inference(SimpleNamespace(intent_id="binary", confirm_verified=False, note=""))
+    output = Mock(); monkeypatch.setattr(common, "emit", output)
+    session.cmd_resolve_inference(SimpleNamespace(intent_id="binary", confirm_verified=True, note=""))
+    archived = output.call_args.args[0]["replaced_unreadable_record"]
+    assert (common.INFERENCE_DIR / archived).read_bytes() == b"\xff\xfe\x00"
+    assert not common.pending_inferences()
+
+
+def test_dead_runner_with_live_child_is_not_reported_as_crashed(remote_agent, monkeypatch):
+    common = remote_agent.C
+    jobs = importlib.import_module("vc_jobs")
+    directory = common.JOBS_DIR / "job-1"
+    common.atomic_write_json(directory / "meta.json", {"job_id": "job-1", "pid": 10})
+    common.atomic_write_json(directory / "status.json", {"state": "running", "runner_pid": 10, "pid": 20})
+    output = Mock(); monkeypatch.setattr(common, "emit", output)
+    monkeypatch.setattr(common, "operation_held", lambda: True)
+    monkeypatch.setattr(common, "pid_alive", lambda pid: pid == 20)
+    jobs.cmd_status(SimpleNamespace(job_id="job-1"))
+    payload = output.call_args.args[0]
+    assert payload["state"] == "running"
+    assert payload["job_may_still_be_running"] is True
+    # Only when no known process is alive is the job allowed to be called crashed.
+    monkeypatch.setattr(common, "pid_alive", lambda pid: False)
+    jobs.cmd_status(SimpleNamespace(job_id="job-1"))
+    assert output.call_args.args[0]["state"] == "crashed"
+
+
+def test_finished_jobs_are_not_liveness_blockers_even_with_reused_pids(remote_agent, monkeypatch):
+    common = remote_agent.C
+    directory = common.JOBS_DIR / "old-job"
+    common.atomic_write_json(directory / "meta.json",
+                             {"job_id": "old-job", "session_id": "S", "pid": 10})
+    common.atomic_write_json(directory / "status.json",
+                             {"state": "succeeded", "pid": 20, "exit_code": 0, "ended_at": 1})
+    monkeypatch.setattr(common, "pid_alive", lambda _: True)
+
+    # Stored PIDs may have been reused by unrelated processes: a trusted
+    # terminal state must not keep the job in the liveness check.
+    assert common.session_jobs("S", alive_only=True) == []
+    assert len(common.session_jobs("S")) == 1  # history stays visible
+
+    # A still-running job with a live pid is still a blocker.
+    common.atomic_write_json(directory / "status.json",
+                             {"state": "running", "runner_pid": 10, "pid": 20})
+    assert common.session_jobs("S", alive_only=True)

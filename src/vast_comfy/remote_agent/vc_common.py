@@ -157,7 +157,7 @@ def read_json(path: Path, default=None):
     try:
         with open(path, "r", encoding="utf-8") as fh:
             return json.load(fh)
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError):  # includes JSONDecodeError and UnicodeDecodeError
         return default
 
 
@@ -540,7 +540,11 @@ def session_jobs(session_id: str, *, alive_only: bool = False) -> list:
         }
         record["runner_alive"] = pid_alive(meta.get("pid"))
         record["persistent_hold"] = bool(pending_inferences(job_id=meta.get("job_id")))
-        if alive_only and not (record["pid_alive"] or record["runner_alive"] or record["persistent_hold"]):
+        # A trusted terminal state wins over stored PIDs: those numbers may have
+        # been reused by unrelated processes after the job ended.
+        terminal = state in ("succeeded", "failed", "timeout") and not record["persistent_hold"]
+        if alive_only and (terminal or not (record["pid_alive"]
+                                            or record["runner_alive"] or record["persistent_hold"])):
             continue
         records.append(record)
     return records
@@ -563,11 +567,16 @@ def cmd_verify_package(args) -> None:
     entries = [line for line in entries if line]
     if not entries:
         problems.append("manifest contains no entries")
+    seen: set[str] = set()
     for line in entries:
         sha_expected, _, rel = line.partition("  ")
         if not sha_expected or not rel:
             problems.append(f"malformed manifest line: {line!r}")
             continue
+        if rel in seen:
+            problems.append(f"duplicate manifest entry: {rel}")
+            continue
+        seen.add(rel)
         target = directory / rel
         if not target.is_file():
             problems.append(f"missing file: {rel}")
@@ -576,7 +585,8 @@ def cmd_verify_package(args) -> None:
         if actual != sha_expected:
             problems.append(f"sha256 mismatch: {rel}")
         checked += 1
-    emit({"ok": not problems, "checked": checked, "problems": problems},
+    emit({"ok": not problems, "checked": checked, "problems": problems,
+          "manifest_sha256": hashlib.sha256(manifest.read_bytes()).hexdigest()},
          exit_code=0 if not problems else 1)
 
 

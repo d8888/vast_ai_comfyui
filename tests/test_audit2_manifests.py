@@ -122,3 +122,38 @@ def test_configured_smoke_case_timeout_reaches_the_dispatched_cases():
     assert {case["timeout_minutes"] for case in doc["cases"]} == {3}
     _, _, default_doc = prepare.smoke_request(load_config(), run_id="timeout-default")
     assert {case["timeout_minutes"] for case in default_doc["cases"]} == {15}
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda doc: doc["cases"][0]["expect"].update(width=-1),
+    lambda doc: doc["cases"][0]["expect"].pop("height"),
+    lambda doc: doc["cases"][0].update(workflow="../escape.json"),
+    lambda doc: doc["cases"][0].update(unknown="value"),
+    lambda doc: doc["cases"][0].update(title=7),
+    lambda doc: doc["cases"][0]["overrides"].update({"6": {"seed": "not-a-seed"}}),
+    lambda doc: doc["cases"][0]["overrides"].update({"6": {"steps": 0}}),
+    lambda doc: doc["cases"][0]["overrides"].update({"6": {"cfg": -1.0}}),
+    lambda doc: doc["cases"][0].update(inputs=["a.png", "a.png"]),
+    lambda doc: doc["cases"][0].update(inputs=["not-a-png.txt"]),
+])
+def test_invalid_smoke_case_document_fails_before_payment(tmp_path, monkeypatch, mutate):
+    import yaml
+
+    from vast_comfy.config import load_config
+
+    doc = copy.deepcopy(prepare.load_smoke_cases())
+    mutate(doc)
+    path = tmp_path / "smoke_cases.yaml"
+    path.write_text(yaml.safe_dump(doc), encoding="utf-8")
+    monkeypatch.setattr(prepare, "_smoke_cases_path", lambda: path)
+    cfg = load_config()
+
+    with pytest.raises(VastComfyError):
+        prepare.smoke_request(cfg, run_id="case-check")
+
+    client = Mock()
+    with pytest.raises(VastComfyError):
+        create_flow.create_and_prepare(client, cfg, alias="rtx_4060_ti_16gb",
+                                       confirm_paid=True, run_id="case-check")
+    client.create_instance.assert_not_called()
+    client.search_offers.assert_not_called()

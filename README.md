@@ -123,7 +123,7 @@ vast-comfy keys list
 
 - **公鑰必須在租用前完成註冊**：帳號金鑰只會注入「之後建立」的 instance。
 - 私鑰永遠留在控制端；已知主機檔案是獨立的 `~/.vast_comfy/known_hosts`，首次連線採 TOFU（`accept-new`），之後主機指紋改變會直接失敗，**不會**自動停用主機驗證。
-- 檔案傳輸預設走 SFTP-based `scp`；若 instance 停用 SFTP，程式只會對**安全字元集**的路徑自動退回舊協定 `-O`。含 shell 特殊字元（空白、`;`、`$`、`*` 等）的路徑一律安全拒絕，不會把路徑交給遠端 shell 解讀。
+- 檔案傳輸協定以**實際執行 `scp` 的 `-O` 支援**判定（同一個執行檔，不看 `ssh`）：支援者預設走 SFTP，SFTP 失敗時僅對**安全字元集**路徑退回 `-O` 舊協定；不支援或無法判定者一律視為舊協定（fail closed），含 shell 特殊字元（空白、`;`、`$`、`*` 等）的路徑在啟動任何傳輸程序前直接安全拒絕，不會把路徑交給遠端 shell 解讀。
 
 ---
 
@@ -256,6 +256,7 @@ vast-comfy --env-file .env ssh tunnel --instance <ID> --stop
 - 本機端只綁定 `127.0.0.1`，不暴露到區域網路。
 - 瀏覽器開 <http://127.0.0.1:8188/>；tunnel 直達 ComfyUI 後端（內部埠 18188），本機不需再登入。
 - tunnel 是控制端本機程序；關掉它不影響 instance 運作。
+- `--stop` 只會終止**通過身分驗證**的 tunnel 程序：啟動時記錄轉送規格與目標，停止前必須在實際程序命令列中重新確認一致（防止 PID 被重用後誤殺不相關程序）。無法確認時安全拒絕並保留紀錄；若程序已不存在則僅清除紀錄並回報 `already_exited: true`。
 
 ### 官方 Portal
 
@@ -577,10 +578,10 @@ Python API 與 CLI 共用同一套驗證、硬條件檢查與執行邏輯；失�
 - 單元測試＋模擬整合測試（本地 mock Vast.ai REST API／SSH／ComfyUI，**不接觸真實網路與 GPU**）：
   ```bash
   .venv\Scripts\python.exe -m pytest
-  # 874 passed, 24 skipped
-  # skipped＝Linux-only 的 flock／FD 實測（14）＋Windows 權限受限的 symlink 測試（10）
+  # 927 passed, 25 skipped
+  # skipped＝Linux-only 的 flock／FD 實測（15）＋Windows 權限受限的 symlink 測試（10）
   ```
-- 經三輪獨立審計後修正並補回歸：付費請求中斷／結果不明一律保留計費與查證資訊、`stop`／`destroy` 未知結果不解除操作鎖、推論逾時後背景 watcher 持續持鎖、跨執行緒操作排他、下載／模型路徑越界、URL 憑證繞過、空白部署清單不通過驗證、舊 scp 協定路徑注入、人工推論解除命令（`session resolve-inference`）、設定逾時實際生效等；逐項證據見 `AUDIT_FIXES.md` 與 `AUDIT3_FIXES.md`。
+- 經四輪獨立審計後修正並補回歸：付費請求中斷／結果不明一律保留計費與查證資訊、`stop`／`destroy` 未知結果不解除操作鎖、推論逾時後背景 watcher 持續持鎖、跨執行緒操作排他、下載／模型路徑越界、URL 憑證繞過、部署清單內容雜湊比對（拒絕空白／重複／遭改寫清單）、scp 協定版本判定與路徑安全、安裝階段各自期限、release 結果不明分類、人工推論解除命令（`session resolve-inference`）、設定逾時實際生效等；逐項證據見 `AUDIT3_FIXES.md` 與 `AUDIT4_FIXES.md`。
 - 覆蓋 SPEC §17 全 19 項：設定嚴格性、alias、硬條件逐項、整合報價與上限、付費授權、不可重試的建立、SSH 與主機指紋、鎖與心跳、job 逾時語意、下載校驗、白名單部署、smoke 判定（舊圖／單色／尺寸／缺節點／busy）、JSON／exit code 契約。
 - 測試細節與範圍見 [`tests/README.md`](./tests/README.md)。
 

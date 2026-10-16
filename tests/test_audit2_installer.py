@@ -103,6 +103,75 @@ def test_remote_verify_package_refuses_an_empty_manifest(installer, tmp_path, mo
     assert payload["checked"] == 0
 
 
+def test_remote_verify_package_refuses_duplicate_entries(installer, tmp_path, monkeypatch):
+    target = tmp_path / "good.txt"
+    target.write_bytes(b"data")
+    sha = hashlib.sha256(b"data").hexdigest()
+    manifest = tmp_path / "manifest.sha256"
+    manifest.write_text(f"{sha}  good.txt\n{sha}  good.txt\n")
+    output = Mock()
+    monkeypatch.setattr(installer.C, "emit", output)
+    installer.C.cmd_verify_package(SimpleNamespace(directory=str(tmp_path), manifest=str(manifest)))
+    payload = output.call_args.args[0]
+    assert output.call_args.kwargs["exit_code"] == 1
+    assert payload["ok"] is False
+    assert any("duplicate" in problem for problem in payload["problems"])
+    assert payload["manifest_sha256"] == hashlib.sha256(manifest.read_bytes()).hexdigest()
+
+
+def test_install_manifest_stops_after_the_stage_deadline(installer, monkeypatch):
+    manifest = build_install_manifest()
+    download = Mock()
+    monkeypatch.setattr(installer, "_download", download)
+    plugin = Mock()
+    monkeypatch.setattr(installer, "_install_plugin", plugin)
+    monkeypatch.setattr(installer.C, "now_epoch", lambda: 100.0)
+
+    with pytest.raises(installer.C.RemoteFail) as error:
+        installer._install_manifest(manifest, deadline=99.0)
+    assert error.value.code == "E_JOB_TIMEOUT"
+    download.assert_not_called()
+    plugin.assert_not_called()
+
+
+def test_install_manifest_runs_while_the_stage_deadline_holds(installer, monkeypatch):
+    manifest = build_install_manifest()
+    monkeypatch.setattr(installer, "_download",
+                        lambda entry: {"id": entry["id"], "action": "skipped"})
+    monkeypatch.setattr(installer, "_install_plugin",
+                        lambda entry: {"id": entry["id"], "action": "skipped"})
+    monkeypatch.setattr(installer.C, "now_epoch", lambda: 100.0)
+
+    result = installer._install_manifest(manifest, deadline=101.0)
+    assert result["ok"] is True and result["changed"] is False
+
+
+def test_install_stage_fails_when_the_last_item_overruns(installer, monkeypatch):
+    manifest = build_install_manifest()
+    clock = {"now": 0.0}
+    monkeypatch.setattr(installer.C, "now_epoch", lambda: clock["now"])
+    monkeypatch.setattr(installer, "_download",
+                        lambda entry: {"id": entry["id"], "action": "skipped"})
+
+    def slow_plugin(entry):
+        clock["now"] = 120.0  # the item itself overran the 60s budget
+        return {"id": entry["id"], "action": "installed"}
+
+    monkeypatch.setattr(installer, "_install_plugin", slow_plugin)
+    with pytest.raises(installer.C.RemoteFail) as error:
+        installer._install_manifest(manifest, deadline=60.0)
+    assert error.value.code == "E_JOB_TIMEOUT"
+
+
+def test_prepare_accepts_the_install_stage_timeout_flag(remote_agent):
+    module = importlib.import_module("vc_prepare")
+    args = module.build_parser().parse_args([
+        "run", "--session-id", "S", "--install-manifest-b64", "W10=", "--cases-b64", "W10=",
+        "--workflows-dir", "w", "--assets-dir", "a", "--run-id", "r",
+        "--install-timeout-seconds", "120"])
+    assert args.install_timeout_seconds == 120.0
+
+
 @pytest.mark.parametrize("text", [
     "curl https://host/file?token=synthetic-sensitive-value",
     "curl https://host/file?api_key=synthetic-sensitive-value&x=1",

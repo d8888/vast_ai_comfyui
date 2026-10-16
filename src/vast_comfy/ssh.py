@@ -277,6 +277,7 @@ class SSHRunner:
     def __init__(self, ctx: SSHContext, *, dry_run: bool = False):
         self.ctx = ctx
         self.dry_run = dry_run
+        self._scp_sftp_default: bool | None = None
 
     # -- command execution ------------------------------------------------
 
@@ -402,27 +403,31 @@ class SSHRunner:
                 base.append("-O")
             return [*base, *operands]
 
-        for legacy in (False, True):
-            if legacy and not _LEGACY_SCP_PATH.fullmatch(remote_path):
-                # Legacy scp (-O) sends the path to the remote shell unquoted.
+        if self.dry_run:
+            logger.info("dry-run scp: %s", shlex.join(args(False)))
+            return
+        # OpenSSH >= 9.0 uses SFTP by default; older scp always speaks the
+        # legacy protocol, where the path must survive the remote shell.
+        modern = self._scp_uses_sftp_by_default()
+        attempts = [False, True] if modern else [False]
+        for legacy in attempts:
+            if (legacy or not modern) and not _LEGACY_SCP_PATH.fullmatch(remote_path):
+                # Legacy scp sends the path to the remote shell unquoted.
                 raise VastComfyError(
                     code=E_SSH_COMMAND,
                     message=(
-                        "The SFTP-based scp failed and the remote path contains characters that "
-                        "are unsafe for the legacy scp protocol; the -O fallback was refused."
+                        "The remote path contains characters that are unsafe for the legacy scp "
+                        "protocol, which passes it to the remote shell unquoted; the transfer was refused."
                     ),
                     stage="ssh",
-                    details={"direction": direction, "path_excerpt": _scrub_tail(remote_path, 120)},
+                    details={"direction": direction, "path_excerpt": _scrub_tail(remote_path, 120),
+                             "scp_uses_sftp_by_default": modern},
                     hints=[
-                        "Legacy scp passes the path to the remote shell unquoted; metacharacters "
-                        "could execute commands on the instance.",
-                        "Rename the file to safe characters, or keep the SFTP subsystem enabled.",
+                        "Rename the file to safe characters, keep the SFTP subsystem enabled, "
+                        "or use OpenSSH 9.0+ where scp uses SFTP by default.",
                     ],
                 )
             full = args(legacy)
-            if self.dry_run:
-                logger.info("dry-run scp: %s", shlex.join(full))
-                return
             try:
                 completed = subprocess.run(full, capture_output=True, timeout=self.ctx.scp_timeout_seconds)
             except FileNotFoundError as exc:
@@ -442,7 +447,7 @@ class SSHRunner:
             stderr = completed.stderr.decode("utf-8", errors="replace")
             # If the modern SFTP-based scp failed and we have not tried the legacy
             # protocol yet, retry once with -O (some sshd configs disable SFTP).
-            if not legacy and "sftp" in stderr.lower():
+            if modern and not legacy and "sftp" in stderr.lower():
                 logger.info("scp failed with %s; retrying with legacy protocol (-O)", _scrub_tail(stderr, 120))
                 continue
             code = classify_ssh_failure(stderr, completed.returncode)
@@ -452,6 +457,26 @@ class SSHRunner:
                 stage="ssh",
                 details={"stderr_excerpt": _scrub_tail(stderr), "direction": direction},
             )
+
+    def _scp_uses_sftp_by_default(self) -> bool:
+        """Whether the local scp speaks SFTP by default (OpenSSH >= 9.0).
+
+        Probes the *same* scp command that will perform the transfer by asking
+        for the -O flag, which only the SFTP-capable versions know. An
+        unparseable or unexpected answer counts as legacy (fail closed).
+        Cached per runner.
+        """
+        if self._scp_sftp_default is None:
+            modern = False
+            try:
+                result = subprocess.run(["scp", "-O"], capture_output=True, text=True,
+                                        timeout=10, stdin=subprocess.DEVNULL)
+                text = ((result.stdout or "") + (result.stderr or "")).lower()
+                modern = "unknown option" not in text and "usage:" in text
+            except (OSError, subprocess.TimeoutExpired):
+                modern = False
+            self._scp_sftp_default = modern
+        return self._scp_sftp_default
 
     # -- tunnel -----------------------------------------------------------
 

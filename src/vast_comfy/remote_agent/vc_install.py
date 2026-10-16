@@ -313,16 +313,27 @@ def _validate_manifest(manifest: dict) -> None:
             ids.add(entry["id"]); destinations.add(dest)
 
 
-def _install_manifest(manifest: dict) -> dict:
+def _check_stage_deadline(deadline: float | None) -> None:
+    if deadline is not None and C.now_epoch() >= deadline:
+        C.fail("E_JOB_TIMEOUT", "The install time budget was exceeded; no further item was started.",
+               job_may_still_be_running=False, takeover_required=True)
+
+
+def _install_manifest(manifest: dict, *, deadline: float | None = None) -> dict:
     _validate_manifest(manifest)  # Validate the entire batch before its first mutation.
     models = []
     plugins = []
     for entry in manifest.get("models", []):
         C.check_deadline()
+        _check_stage_deadline(deadline)
         models.append(_download(entry))
     for entry in manifest.get("plugins", []):
         C.check_deadline()
+        _check_stage_deadline(deadline)
         plugins.append(_install_plugin(entry))
+    # The last item's own duration also counts: an install stage that already
+    # overran its budget must not hand off to restart/smoke as if on budget.
+    _check_stage_deadline(deadline)
     changed = any(m["action"] == "downloaded" for m in models) or any(
         p["action"] == "installed" for p in plugins
     )

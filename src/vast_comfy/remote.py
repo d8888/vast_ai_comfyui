@@ -205,6 +205,7 @@ def deploy_package(runner: SSHRunner, cfg: Config, *, session_id: str, force: bo
 
 def _deploy_package(runner: SSHRunner, cfg: Config, *, force: bool = False) -> dict:
     info = build_package()
+    expected_manifest_sha256 = hashlib.sha256(info.manifest_text.encode("utf-8")).hexdigest()
     remote_pkg = package_dir(cfg, info.package_hash)
     venv_python = str(cfg.require("image.venv_python"))
     runtime = runtime_root(cfg)
@@ -228,9 +229,14 @@ def _deploy_package(runner: SSHRunner, cfg: Config, *, force: bool = False) -> d
         if probe.rc == 0:
             try:
                 payload = json.loads(probe.stdout.strip().splitlines()[-1])
-                # The verification must cover exactly the expected file set;
-                # an empty or truncated manifest is not proof of integrity.
-                verified_already = bool(payload.get("ok")) and payload.get("checked") == len(info.records)
+                # The verification must cover exactly the expected file set its
+                # content hash must match the manifest this run would produce;
+                # an empty, truncated or edited manifest is not proof of integrity.
+                verified_already = (
+                    bool(payload.get("ok"))
+                    and payload.get("checked") == len(info.records)
+                    and payload.get("manifest_sha256") == expected_manifest_sha256
+                )
             except (ValueError, IndexError):
                 verified_already = False
 
@@ -247,7 +253,7 @@ def _deploy_package(runner: SSHRunner, cfg: Config, *, force: bool = False) -> d
                 runner.upload(record["local"], f"{remote_pkg}/{record['rel']}")
                 uploaded += 1
             manifest_local = tmp_dir / "manifest.sha256"
-            manifest_local.write_text(info.manifest_text, encoding="utf-8")
+            manifest_local.write_bytes(info.manifest_text.encode("utf-8"))
             runner.upload(str(manifest_local), f"{remote_pkg}/manifest.sha256")
 
         verify = runner.run_remote(
@@ -271,15 +277,18 @@ def _deploy_package(runner: SSHRunner, cfg: Config, *, force: bool = False) -> d
                 stage="deploy",
                 details={"rc": verify.rc, "stdout_excerpt": verify.stdout[-300:].strip()},
             ) from exc
-        if verify.rc != 0 or not payload.get("ok") or payload.get("checked") != len(info.records):
+        if (verify.rc != 0 or not payload.get("ok")
+                or payload.get("checked") != len(info.records)
+                or payload.get("manifest_sha256") != expected_manifest_sha256):
             raise VastComfyError(
                 code=E_DEPLOY,
                 message=(
-                    "Remote package verification failed or did not cover every expected file; "
-                    "the deployment is not trusted"
+                    "Remote package verification failed or did not cover exactly the expected "
+                    "files; the deployment is not trusted"
                 ),
                 stage="deploy",
-                details={"rc": verify.rc, "verify": payload, "expected_files": len(info.records)},
+                details={"rc": verify.rc, "verify": payload, "expected_files": len(info.records),
+                         "expected_manifest_sha256": expected_manifest_sha256},
             )
 
     # Point `current` at the verified package (atomic symlink swap).

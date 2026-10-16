@@ -6,13 +6,27 @@ records, tunnel PIDs, job references. Never stores API keys or private keys.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Any
 
 from .errors import VastComfyError, E_INTERNAL
+
+_LOCKS_GUARD = threading.Lock()
+_LOCKS: dict[str, threading.RLock] = {}
+
+
+def _thread_lock(key: str) -> threading.RLock:
+    with _LOCKS_GUARD:
+        lock = _LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _LOCKS[key] = lock
+        return lock
 
 
 class StateStore:
@@ -52,23 +66,69 @@ class StateStore:
             fh.write("\n")
         os.replace(tmp, path)
 
+    @contextlib.contextmanager
+    def _update_lock(self, name: str):
+        """Serialize one file's read-modify-write across threads and processes."""
+        with _thread_lock(f"{self.root.resolve()}:{name}"):
+            handle = None
+            try:
+                handle = (self.root / f".{name}.lock").open("a+b")
+            except OSError:
+                # Incomplete or mocked root: keep the in-process guarantee.
+                pass
+            try:
+                if handle is not None:
+                    if os.fstat(handle.fileno()).st_size == 0:
+                        handle.write(b"0")
+                        handle.flush()
+                    handle.seek(0)
+                    if os.name == "posix":
+                        import fcntl
+
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                    elif os.name == "nt":
+                        import msvcrt
+
+                        while True:
+                            try:
+                                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                                break
+                            except OSError:
+                                time.sleep(0.02)
+                yield
+            finally:
+                if handle is not None:
+                    try:
+                        if os.name == "posix":
+                            import fcntl
+
+                            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                        elif os.name == "nt":
+                            import msvcrt
+
+                            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                    finally:
+                        handle.close()
+
     # -- generic ---------------------------------------------------------
 
     def put(self, name: str, key: str, record: dict[str, Any]) -> None:
-        data = self._load(name)
-        record = dict(record)
-        record.setdefault("updated_at", time.time())
-        data[str(key)] = record
-        self._save(name, data)
+        with self._update_lock(name):
+            data = self._load(name)
+            record = dict(record)
+            record.setdefault("updated_at", time.time())
+            data[str(key)] = record
+            self._save(name, data)
 
     def get(self, name: str, key: str) -> dict[str, Any] | None:
         return self._load(name).get(str(key))
 
     def remove(self, name: str, key: str) -> None:
-        data = self._load(name)
-        if str(key) in data:
-            del data[str(key)]
-            self._save(name, data)
+        with self._update_lock(name):
+            data = self._load(name)
+            if str(key) in data:
+                del data[str(key)]
+                self._save(name, data)
 
     def all(self, name: str) -> dict[str, Any]:
         return self._load(name)

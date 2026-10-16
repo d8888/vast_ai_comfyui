@@ -26,7 +26,7 @@ import yaml
 
 from . import jobs, locks, remote
 from .config import Config, _UniqueKeySafeLoader
-from .errors import ConfigError, E_JOB_FAILED, E_SMOKE_FAILED, VastComfyError
+from .errors import ConfigError, E_JOB_FAILED, E_LOCK_NOT_HELD, E_SMOKE_FAILED, VastComfyError
 from .paths import find_repo_root
 from .ssh import SSHRunner
 from .safety import validate_identifier
@@ -223,8 +223,97 @@ def build_models_payload(manifest: dict) -> list[dict]:
     ]
 
 
+def _smoke_cases_path() -> Path:
+    return find_repo_root() / "assets" / "smoke" / "smoke_cases.yaml"
+
+
+_SMOKE_CASE_REQUIRED = {"id", "workflow", "timeout_minutes", "overrides", "expect", "inputs"}
+_SMOKE_CASE_ALLOWED = _SMOKE_CASE_REQUIRED | {"title"}
+_SMOKE_CASE_IDS = ["base_t2i", "lllite_lineart", "lllite_inpaint", "turbo_t2i"]
+_MAX_CASE_SEED = (1 << 64) - 1
+
+
+def _case_number(value: Any) -> bool:
+    return type(value) in (int, float) and math.isfinite(value) and value > 0
+
+
+def _case_positive_int(value: Any) -> bool:
+    return type(value) is int and value > 0
+
+
+def _validate_case_json_value(value: Any) -> None:
+    """Only JSON values with finite floats and string keys (mirrors the remote)."""
+    if value is None or type(value) in (bool, int, str):
+        return
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise ConfigError("case override values must be finite")
+        return
+    if isinstance(value, list):
+        for item in value:
+            _validate_case_json_value(item)
+        return
+    if isinstance(value, dict):
+        if any(not isinstance(key, str) for key in value):
+            raise ConfigError("case override keys must be strings")
+        for item in value.values():
+            _validate_case_json_value(item)
+        return
+    raise ConfigError("case override values must be JSON values")
+
+
+def _validate_case_entry(case: Any) -> None:
+    """Controller-side equivalent of the remote case validator, one case.
+
+    Anything the remote validator would reject must fail before a lock, upload
+    or paid instance is involved.
+    """
+    if not isinstance(case, dict):
+        raise ConfigError("smoke cases must be mappings")
+    if not _SMOKE_CASE_REQUIRED <= case.keys() or case.keys() - _SMOKE_CASE_ALLOWED:
+        raise ConfigError("smoke case has missing or unknown fields")
+    if "title" in case and not isinstance(case["title"], str):
+        raise ConfigError("smoke case title must be a string")
+    workflow = case["workflow"]
+    if (not isinstance(workflow, str) or not workflow.endswith(".json") or workflow.startswith("/")
+            or any(c in workflow for c in ("\\", ":", "\0"))
+            or any(part in ("", ".", "..") or part.startswith("~") for part in workflow.split("/"))):
+        raise ConfigError("smoke case workflow must be a safe relative .json path")
+    if not _case_number(case["timeout_minutes"]) or not math.isfinite(case["timeout_minutes"] * 60):
+        raise ConfigError("case timeout_minutes must be finite and positive")
+    expect = case["expect"]
+    if (not isinstance(expect, dict) or set(expect) != {"width", "height"}
+            or not all(_case_positive_int(value) for value in expect.values())):
+        raise ConfigError("case expect requires positive integer width and height")
+    inputs = case["inputs"]
+    if not isinstance(inputs, list):
+        raise ConfigError("case inputs must be a list")
+    for name in inputs:
+        if (not isinstance(name, str) or not name or not name.lower().endswith(".png")
+                or any(c in name for c in ("\\", ":", "\0", "[", "]"))
+                or any(part in ("", ".", "..") or part.startswith("~") for part in name.split("/"))):
+            raise ConfigError("case inputs must be safe relative PNG paths")
+    if len(set(inputs)) != len(inputs):
+        raise ConfigError("input asset names must be unique")
+    overrides = case["overrides"]
+    if not isinstance(overrides, dict) or any(
+            not isinstance(node_id, str) or not node_id or not isinstance(values, dict)
+            for node_id, values in overrides.items()):
+        raise ConfigError("overrides must map node ids to input mappings")
+    _validate_case_json_value(overrides)
+    for values in overrides.values():
+        for key, value in values.items():
+            if key in {"width", "height", "batch_size", "steps"} and not _case_positive_int(value):
+                raise ConfigError(f"case override {key} must be a positive integer")
+            if key in {"cfg", "strength", "denoise"} and not _case_number(value):
+                raise ConfigError(f"case override {key} must be finite and positive")
+            if key == "seed" and value != "$run_seed" and not (
+                    type(value) is int and 0 <= value <= _MAX_CASE_SEED):
+                raise ConfigError("case override seed must be $run_seed or a uint64")
+
+
 def load_smoke_cases() -> dict:
-    path = find_repo_root() / "assets" / "smoke" / "smoke_cases.yaml"
+    path = _smoke_cases_path()
     try:
         data = yaml.load(path.read_text(encoding="utf-8"), Loader=_UniqueKeySafeLoader)
     except OSError as exc:
@@ -235,16 +324,9 @@ def load_smoke_cases() -> dict:
         raise ConfigError(f"{path} must contain schema_version: 1 and a 'cases' list")
     if type(data["schema_version"]) is not int or set(data) != {"schema_version", "cases"}:
         raise ConfigError("invalid smoke cases schema")
-    ids = []
     for case in data["cases"]:
-        if not isinstance(case, dict):
-            raise ConfigError("smoke cases must be mappings")
-        ids.append(case.get("id"))
-        timeout = case.get("timeout_minutes")
-        if (type(timeout) not in (int, float) or not math.isfinite(timeout)
-                or timeout <= 0 or not math.isfinite(timeout * 60)):
-            raise ConfigError("case timeout_minutes must be finite and positive")
-    if ids != ["base_t2i", "lllite_lineart", "lllite_inpaint", "turbo_t2i"]:
+        _validate_case_entry(case)
+    if [case["id"] for case in data["cases"]] != _SMOKE_CASE_IDS:
         raise ConfigError("the configured suite must contain the four required cases in order")
     return data
 
@@ -365,6 +447,8 @@ def prepare_existing(
             f"{remote.current_link(cfg)}/assets/smoke",
             "--run-id",
             actual_run_id,
+            "--install-timeout-seconds",
+            str(float(cfg.require("jobs.install_timeout_minutes")) * 60),
             "--base-seed",
             str(seed),
             "--comfy-url", f"http://localhost:{cfg.require('image.internal_port')}",
@@ -454,22 +538,74 @@ def prepare_existing(
             ],
         )
 
-    summary = remote.read_remote_json(runner, cfg, summary_path)
+    try:
+        summary = remote.read_remote_json(runner, cfg, summary_path)
+    except VastComfyError as exc:
+        raise VastComfyError(
+            code=exc.code,
+            message=f"The job succeeded but its summary could not be read: {exc.message}",
+            stage="prepare",
+            details={
+                **exc.details,
+                "job_id": job_id,
+                "run_id": actual_run_id,
+                "summary_path": summary_path,
+                "session_id": sid,
+                "lock_state": "still held by this session unless explicitly released",
+                "instance_billing": "the instance continues to run",
+            },
+            hints=list(exc.hints) + [
+                "The smoke verdict is UNKNOWN until the summary is readable; inspect `jobs logs` before deciding."
+            ],
+        ) from exc
 
     release_result: dict | None = None
     if release_on_success:
         try:
             release_result = locks.release(runner, cfg, sid)
         except VastComfyError as exc:
-            # The smoke result is verified, but the explicitly requested session
-            # release did not happen: the flow is NOT complete and must not be
-            # reported as an overall success.
-            raise VastComfyError(
-                code=exc.code,
-                message=(
+            # Three distinct outcomes: a transport failure may happen AFTER the
+            # daemon released the lock; a structured ownership error proves we
+            # no longer hold it; only a "still owned but refused" result proves
+            # the release did not happen.
+            if exc.code in ("E_NETWORK", "E_SSH_CONNECT", "E_SSH_COMMAND", "E_UPSTREAM", "E_INTERNAL"):
+                release_outcome = "unknown"
+                lock_state = "release outcome UNKNOWN; verify with `vast-comfy session status`"
+                message = (
+                    "The prepare flow reached its final stage but the session release "
+                    f"outcome is UNKNOWN: {exc.message}"
+                )
+                hints = [
+                    "The verified smoke result above is preserved.",
+                    "Check `session status`: if the lock is free the release actually completed; "
+                    "if it is still held, release explicitly.",
+                ]
+            elif exc.code == E_LOCK_NOT_HELD:
+                release_outcome = "not_held"
+                lock_state = "release not performed: this session no longer owns the lock"
+                message = (
+                    "The prepare flow reached its final stage but the session release "
+                    f"was not performed because this session no longer owns the lock: {exc.message}"
+                )
+                hints = [
+                    "The verified smoke result above is preserved.",
+                    "Inspect `session status` and decide explicitly whether anything must be "
+                    "released or recovered.",
+                ]
+            else:
+                release_outcome = "not_released"
+                lock_state = "still held by this session; NOT released"
+                message = (
                     "The prepare flow reached its final stage but the explicitly requested "
                     f"session release did not happen: {exc.message}"
-                ),
+                )
+                hints = [
+                    "The verified smoke result above is preserved; only the session release is unresolved.",
+                    "Resolve the reported conflict, then run `vast-comfy session release` explicitly.",
+                ]
+            raise VastComfyError(
+                code=exc.code,
+                message=message,
                 stage="prepare",
                 details={
                     **exc.details,
@@ -481,13 +617,11 @@ def prepare_existing(
                     "summary_path": summary_path,
                     "summary": summary,
                     "release_error": exc.to_dict(),
-                    "lock_state": "still held by this session; NOT released",
+                    "release_outcome": release_outcome,
+                    "lock_state": lock_state,
                     "instance_billing": "the instance continues to run",
                 },
-                hints=[
-                    "The verified smoke result above is preserved; only the session release is unresolved.",
-                    "Resolve the reported conflict, then run `vast-comfy session release` explicitly.",
-                ],
+                hints=hints,
             ) from exc
 
     return {

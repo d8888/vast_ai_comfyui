@@ -207,8 +207,10 @@ def _effective_state(status: dict, *, meta=None, progress=None, pending=None) ->
     if state in ("running", "overdue") and (progress or {}).get("state") == "overdue":
         return "overdue"
     if state in ("running", "overdue"):
-        pid = runner_pid or status.get("pid")
-        if pid and not C.pid_alive(pid):
+        # Only claim "crashed" when no known process is alive: the runner dying
+        # does not prove its child (install/smoke work) has stopped.
+        pids = [pid for pid in (runner_pid, status.get("pid")) if pid]
+        if pids and not any(C.pid_alive(pid) for pid in pids):
             return "crashed"
     return state
 

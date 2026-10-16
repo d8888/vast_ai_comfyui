@@ -200,56 +200,104 @@ def test_execute_dry_run_does_not_spawn(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Legacy scp fallback: never hand shell-metacharacter paths to the remote shell
+# scp protocol selection: never hand shell-metacharacter paths to the remote shell
 # ---------------------------------------------------------------------------
 
 
 class _Completed:
-    def __init__(self, rc: int, stderr: bytes = b"") -> None:
+    def __init__(self, rc: int, stderr: bytes | str = b"") -> None:
         self.returncode = rc
         self.stdout = b""
         self.stderr = stderr
 
 
 _SFTP_FAILURE = b"subsystem request failed on channel 0\nscp: sftp unavailable"
+_MODERN_PROBE = ("usage: scp [-346ABCOpqRrsTv] [-c cipher] [-D sftp_server_path] "
+                 "[-F ssh_config]\n           [-i identity_file] source ... target\n")
+_OLD_PROBE = ("scp: unknown option -- O\n"
+              "usage: scp [-12346BCEpqrv] [-c cipher] [-F ssh_config] source ... target\n")
 
 
-def test_legacy_scp_fallback_refuses_shell_metacharacter_paths(tmp_path, monkeypatch):
-    ctx = make_ctx(tmp_path)
-    runner = SSHRunner(ctx)
+def _scp_fake(probe_output: str, replies: list[_Completed]):
+    """subprocess.run stand-in: answers the `scp -O` probe, then scripted transfers."""
     calls: list[list[str]] = []
+    pending = list(replies)
 
     def fake_run(argv, **kwargs):
-        calls.append(list(argv))
-        return _Completed(1, stderr=_SFTP_FAILURE)
+        argv = list(argv)
+        calls.append(argv)
+        if argv[:2] == ["scp", "-O"]:
+            return _Completed(1, stderr=probe_output)  # text mode, like the real call
+        assert pending, "unexpected extra scp attempt"
+        return pending.pop(0)
 
+    def scp_calls() -> list[list[str]]:
+        return [call for call in calls if call[:1] == ["scp"] and call[:2] != ["scp", "-O"]]
+
+    return fake_run, calls, scp_calls
+
+
+def test_modern_scp_falls_back_to_legacy_only_for_safe_paths(tmp_path, monkeypatch):
+    ctx = make_ctx(tmp_path)
+    runner = SSHRunner(ctx)
+    fake_run, calls, scp_calls = _scp_fake(
+        _MODERN_PROBE, [_Completed(1, stderr=_SFTP_FAILURE), _Completed(0)]
+    )
+    monkeypatch.setattr("vast_comfy.ssh.subprocess.run", fake_run)
+    runner.download("/workspace/ComfyUI/output/vast_probe.png", str(tmp_path / "local.bin"))
+    scp = scp_calls()
+    assert len(scp) == 2
+    assert "-O" not in scp[0] and "-O" in scp[1]
+    assert "root@ssh5.vast.ai:/workspace/ComfyUI/output/vast_probe.png" in scp[1]
+
+
+def test_modern_scp_refuses_metacharacter_paths_before_the_legacy_retry(tmp_path, monkeypatch):
+    ctx = make_ctx(tmp_path)
+    runner = SSHRunner(ctx)
+    fake_run, calls, scp_calls = _scp_fake(_MODERN_PROBE, [_Completed(1, stderr=_SFTP_FAILURE)])
     monkeypatch.setattr("vast_comfy.ssh.subprocess.run", fake_run)
     with pytest.raises(VastComfyError) as excinfo:
         runner.download("/workspace/ComfyUI/output/probe;id.png", str(tmp_path / "local.bin"))
     error = excinfo.value
     assert error.code == "E_SSH_COMMAND"
     assert "legacy" in error.message.lower()
-    # Only the SFTP attempt ran; -O was refused before spawning anything.
-    assert len(calls) == 1
-    assert "-O" not in calls[0]
+    assert error.details["scp_uses_sftp_by_default"] is True
+    # The SFTP attempt may run (its path handling is safe), but -O is refused.
+    assert len(scp_calls()) == 1
+    assert all("-O" not in call for call in scp_calls())
 
 
-def test_legacy_scp_fallback_is_still_used_for_safe_paths(tmp_path, monkeypatch):
+@pytest.mark.parametrize("probe", [_OLD_PROBE, "unexpected noise without any marker"])
+def test_legacy_scp_never_sends_metacharacter_paths_at_all(tmp_path, monkeypatch, probe):
     ctx = make_ctx(tmp_path)
     runner = SSHRunner(ctx)
-    calls: list[list[str]] = []
+    fake_run, calls, scp_calls = _scp_fake(probe, [])
+    monkeypatch.setattr("vast_comfy.ssh.subprocess.run", fake_run)
+    with pytest.raises(VastComfyError) as excinfo:
+        runner.download("/workspace/ComfyUI/output/probe;id.png", str(tmp_path / "local.bin"))
+    assert excinfo.value.code == "E_SSH_COMMAND"
+    assert excinfo.value.details["scp_uses_sftp_by_default"] is False
+    assert scp_calls() == []  # refused before any scp process was spawned
 
-    def fake_run(argv, **kwargs):
-        calls.append(list(argv))
-        if len(calls) == 1:
-            return _Completed(1, stderr=_SFTP_FAILURE)
-        return _Completed(0)
 
+def test_legacy_scp_transfers_safe_paths_without_the_legacy_flag(tmp_path, monkeypatch):
+    ctx = make_ctx(tmp_path)
+    runner = SSHRunner(ctx)
+    fake_run, calls, scp_calls = _scp_fake(_OLD_PROBE, [_Completed(0)])
     monkeypatch.setattr("vast_comfy.ssh.subprocess.run", fake_run)
     runner.download("/workspace/ComfyUI/output/vast_probe.png", str(tmp_path / "local.bin"))
-    assert len(calls) == 2
-    assert "-O" in calls[1]
-    assert "root@ssh5.vast.ai:/workspace/ComfyUI/output/vast_probe.png" in calls[1]
+    scp = scp_calls()
+    assert len(scp) == 1 and "-O" not in scp[0]
+
+
+def test_dry_run_scp_never_probes_the_scp_binary(tmp_path, monkeypatch):
+    ctx = make_ctx(tmp_path)
+    runner = SSHRunner(ctx, dry_run=True)
+    calls: list[list[str]] = []
+    monkeypatch.setattr("vast_comfy.ssh.subprocess.run",
+                        lambda argv, **kw: calls.append(list(argv)) or _Completed(0))
+    runner.download("/workspace/ComfyUI/output/probe;id.png", str(tmp_path / "local.bin"))
+    assert calls == []
 
 
 # ---------------------------------------------------------------------------

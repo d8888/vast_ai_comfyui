@@ -448,11 +448,11 @@ def cmd_resolve_inference(args) -> None:
             intent_id=intent_id,
         )
     archived = None
-    if record is None:
-        # The record is unreadable (corrupt JSON, dangling link, ...). Preserve
-        # the raw bytes under a name the fence never reads, then replace it with
-        # the operator's resolution. os.replace moves a symlink itself, never
-        # the link target.
+    if not isinstance(record, dict) or record.get("intent_id") != intent_id:
+        # Unreadable, non-object or mislabelled record: preserve the raw bytes
+        # under a name the fence never reads, then replace it with the
+        # operator's resolution. os.replace moves a symlink itself, never the
+        # link target.
         archived = f"{intent_id}.unreadable-{os.urandom(4).hex()}"
         os.replace(path, C.confined_path(C.INFERENCE_DIR, archived))
         record = {"intent_id": intent_id}

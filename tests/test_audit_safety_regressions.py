@@ -133,7 +133,7 @@ def test_windows_remote_paths_remain_posix(cfg, monkeypatch):
     runner = FakeRunner()
     runner.add_rule("mkdir")
     runner.add_rule("current/remote/vc_common.py", stdout="not present", rc=1)
-    runner.add_json("vc_common.py", {"ok": True})
+    runner.add_json("vc_common.py", {"ok": True, "checked": len(remote.build_package().records)})
     runner.add_rule("ln -s")
     runner.add_rule("mv -T")
     remote.deploy_package(runner, cfg, session_id="S")

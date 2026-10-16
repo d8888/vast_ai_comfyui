@@ -156,3 +156,85 @@ def test_prepare_does_not_release_when_config_says_keep(cfg, monkeypatch):
     release = Mock(); monkeypatch.setattr(prepare.locks, "release", release)
     assert prepare.prepare_existing(Mock(), cfg, instance_id=123)["ok"]
     release.assert_not_called()
+
+
+def test_interrupted_paid_request_is_uncertain_and_never_retried(cfg, monkeypatch):
+    monkeypatch.setattr(rental, "rental_preflight", lambda *_: {})
+    client = Mock(); client.create_instance.side_effect = KeyboardInterrupt
+    with pytest.raises(VastComfyError) as error:
+        rental.create_instance(client, cfg, make_offer(), "audit", paid_confirmed=True)
+    assert error.value.code == "E_CREATE_UNCERTAIN"
+    assert error.value.details["instance_may_be_billing"] is True
+    assert error.value.details["cause"] == {"error_type": "KeyboardInterrupt"}
+    client.create_instance.assert_called_once()
+
+
+def test_interrupted_post_create_keeps_billing_handoff():
+    from vast_comfy.vast.rental import created_resource
+
+    with pytest.raises(VastComfyError) as error:
+        with created_resource({"instance_id": 777, "label": "audit"}):
+            raise KeyboardInterrupt
+    details = error.value.details
+    assert details["instance_id"] == 777
+    assert details["instance_may_be_billing"] is True
+    assert "NOT stopped or destroyed" in details["instance_billing"]
+
+
+def test_comfy_health_uses_the_configured_health_timeout(cfg, monkeypatch):
+    cfg = load_config(set_overrides={"comfy.health_timeout_seconds": 45})
+    invoke = Mock(return_value={"ok": True}); monkeypatch.setattr(comfy, "invoke", invoke)
+    comfy.health(Mock(), cfg, "S")
+    assert invoke.call_args.kwargs["timeout_seconds"] == 45
+
+
+def test_prepare_failure_after_lock_carries_handoff_details(cfg, monkeypatch):
+    monkeypatch.setattr(prepare.locks, "acquire", lambda *a, **k: {"session_id": "auto-sid"})
+
+    def boom(*a, **k):
+        raise VastComfyError("E_SSH_COMMAND", "deploy failed")
+
+    monkeypatch.setattr(prepare.remote, "deploy_package", boom)
+    with pytest.raises(VastComfyError) as error:
+        prepare.prepare_existing(Mock(), cfg, instance_id=4242, run_id="run-handoff")
+    details = error.value.details
+    assert error.value.stage == "prepare"
+    assert details["session_id"] == "auto-sid"
+    assert details["run_id"] == "run-handoff"
+    assert "still held" in details["lock_state"]
+    assert "continues to run" in details["instance_billing"]
+
+
+def test_prepare_wait_failure_carries_the_job_id(cfg, monkeypatch):
+    monkeypatch.setattr(prepare.locks, "acquire", lambda *a, **k: {"session_id": "auto-sid"})
+    monkeypatch.setattr(prepare.remote, "deploy_package", lambda *a, **k: {})
+    monkeypatch.setattr(prepare.jobs, "start", lambda *a, **k: {"job_id": "job-77"})
+
+    def timeout(*a, **k):
+        raise VastComfyError("E_NETWORK", "status poll failed")
+
+    monkeypatch.setattr(prepare.jobs, "wait", timeout)
+    with pytest.raises(VastComfyError) as error:
+        prepare.prepare_existing(Mock(), cfg, instance_id=4242, run_id="run-wait")
+    assert error.value.details["job_id"] == "job-77"
+    assert error.value.details["session_id"] == "auto-sid"
+
+
+def test_explicit_release_failure_is_not_reported_as_overall_success(cfg, monkeypatch):
+    monkeypatch.setattr(prepare.locks, "acquire", lambda *a, **k: {"session_id": "S"})
+    monkeypatch.setattr(prepare.remote, "deploy_package", lambda *a, **k: {})
+    monkeypatch.setattr(prepare.jobs, "start", lambda *a, **k: {"job_id": "J"})
+    monkeypatch.setattr(prepare.jobs, "wait", lambda *a, **k: {"state": "succeeded"})
+    monkeypatch.setattr(prepare.remote, "read_remote_json", lambda *a: {"verdict": "READY"})
+
+    def boom(*a, **k):
+        raise VastComfyError("E_LOCK_JOBS_RUNNING", "jobs still alive")
+
+    monkeypatch.setattr(prepare.locks, "release", boom)
+    with pytest.raises(VastComfyError) as error:
+        prepare.prepare_existing(Mock(), cfg, instance_id=123, release_on_success=True)
+    details = error.value.details
+    assert error.value.code == "E_LOCK_JOBS_RUNNING"
+    assert details["verdict"] == "READY"
+    assert details["release_error"]["code"] == "E_LOCK_JOBS_RUNNING"
+    assert "NOT released" in details["lock_state"]

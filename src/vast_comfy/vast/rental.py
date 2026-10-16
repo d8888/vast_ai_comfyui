@@ -157,6 +157,9 @@ def create_instance(
         if ambiguous:
             raise uncertain(cause=exc.to_dict()) from exc
         raise
+    except KeyboardInterrupt as exc:
+        # An interrupt during the paid request may arrive after acceptance.
+        raise uncertain(cause={"error_type": "KeyboardInterrupt"}) from exc
     except Exception as exc:
         # A client/response-decoding failure after dispatch is not evidence of
         # rejection. Do not expose exception text, which may include credentials.
@@ -188,7 +191,7 @@ def created_resource(created: dict):
     """Keep billing/resource references on EVERY failure after paid creation."""
     try:
         yield
-    except Exception as exc:
+    except (Exception, KeyboardInterrupt) as exc:
         error = exc if isinstance(exc, VastComfyError) else VastComfyError(
             code="E_INTERNAL", message="A post-create operation failed; the instance may still be billing.",
             stage="post_create", details={"error_type": type(exc).__name__})

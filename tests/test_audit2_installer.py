@@ -90,6 +90,19 @@ def test_model_destination_symlink_escape_refused(installer, tmp_path, monkeypat
     assert list(outside.iterdir()) == []
 
 
+def test_remote_verify_package_refuses_an_empty_manifest(installer, tmp_path, monkeypatch):
+    manifest = tmp_path / "manifest.sha256"
+    manifest.write_text("")
+    output = Mock()
+    monkeypatch.setattr(installer.C, "emit", output)
+    installer.C.cmd_verify_package(SimpleNamespace(directory=str(tmp_path), manifest=str(manifest)))
+    payload = output.call_args.args[0]
+    assert output.call_args.kwargs["exit_code"] == 1
+    assert payload["ok"] is False
+    assert any("no entries" in problem for problem in payload["problems"])
+    assert payload["checked"] == 0
+
+
 @pytest.mark.parametrize("text", [
     "curl https://host/file?token=synthetic-sensitive-value",
     "curl https://host/file?api_key=synthetic-sensitive-value&x=1",

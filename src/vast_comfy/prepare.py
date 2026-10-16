@@ -257,6 +257,11 @@ def smoke_request(cfg: Config, *, run_id=None, base_seed=None, cases=None):
             or not 0 <= seed < 2**64 or int(seed) != seed):
         raise ConfigError("smoke seed must be a uint64")
     doc = load_smoke_cases()
+    # The configured per-case budget is the runtime authority (SPEC 14.1); the
+    # bundled YAML only carries the shipped defaults.
+    case_timeout = float(cfg.require("jobs.smoke_case_timeout_minutes"))
+    for case in doc["cases"]:
+        case["timeout_minutes"] = case_timeout
     if cases is not None:
         if not isinstance(cases, str) or not cases.strip():
             raise ConfigError("cases must be a non-empty comma-separated selection")
@@ -331,53 +336,73 @@ def prepare_existing(
     models = build_models_payload(manifest)
     lock = locks.acquire(runner, cfg, instance_id, session_id=session_id)
     sid = lock["session_id"]
-    deploy = remote.deploy_package(runner, cfg, session_id=sid)
+    job_id: str | None = None
+    try:
+        deploy = remote.deploy_package(runner, cfg, session_id=sid)
 
-    timeout_seconds = (
-        float(cfg.require("jobs.install_timeout_minutes")) * 60
-        + sum(float(c.get("timeout_minutes", 15)) for c in cases_doc["cases"]) * 60
-        + 900  # preflight + restarts + report
-    )
-    argv = [
-        "run",
-        "--session-id",
-        sid,
-        "--instance-id",
-        str(instance_id),
-        "--image-ref",
-        f"{cfg.require('image.repository')}:{cfg.require('image.tag')}",
-        "--install-manifest-b64",
-        b64_json(manifest),
-        "--models-b64",
-        b64_json(models),
-        "--cases-b64",
-        b64_json(cases_doc),
-        "--workflows-dir",
-        f"{remote.current_link(cfg)}/workflows/api",
-        "--assets-dir",
-        f"{remote.current_link(cfg)}/assets/smoke",
-        "--run-id",
-        actual_run_id,
-        "--base-seed",
-        str(seed),
-        "--comfy-url", f"http://localhost:{cfg.require('image.internal_port')}",
-        "--service", str(cfg.require("image.supervisor_service")),
-        "--wait-seconds", str(cfg.require("comfy.restart_wait_seconds")),
-    ]
-    if cases:
-        argv += ["--cases", cases]
-    if verify_model_shas:
-        argv.append("--verify-model-shas")
+        timeout_seconds = (
+            float(cfg.require("jobs.install_timeout_minutes")) * 60
+            + sum(float(c.get("timeout_minutes", 15)) for c in cases_doc["cases"]) * 60
+            + 900  # preflight + restarts + report
+        )
+        argv = [
+            "run",
+            "--session-id",
+            sid,
+            "--instance-id",
+            str(instance_id),
+            "--image-ref",
+            f"{cfg.require('image.repository')}:{cfg.require('image.tag')}",
+            "--install-manifest-b64",
+            b64_json(manifest),
+            "--models-b64",
+            b64_json(models),
+            "--cases-b64",
+            b64_json(cases_doc),
+            "--workflows-dir",
+            f"{remote.current_link(cfg)}/workflows/api",
+            "--assets-dir",
+            f"{remote.current_link(cfg)}/assets/smoke",
+            "--run-id",
+            actual_run_id,
+            "--base-seed",
+            str(seed),
+            "--comfy-url", f"http://localhost:{cfg.require('image.internal_port')}",
+            "--service", str(cfg.require("image.supervisor_service")),
+            "--wait-seconds", str(cfg.require("comfy.restart_wait_seconds")),
+        ]
+        if cases:
+            argv += ["--cases", cases]
+        if verify_model_shas:
+            argv.append("--verify-model-shas")
 
-    job = jobs.start(
-        runner,
-        cfg,
-        sid,
-        "prepare",
-        jobs.prepare_command(cfg, "vc_prepare.py", argv),
-        timeout_seconds=timeout_seconds,
-    )
-    job_id = job["job_id"]
+        job = jobs.start(
+            runner,
+            cfg,
+            sid,
+            "prepare",
+            jobs.prepare_command(cfg, "vc_prepare.py", argv),
+            timeout_seconds=timeout_seconds,
+        )
+        job_id = job["job_id"]
+    except VastComfyError as exc:
+        # The session lock is already ours: every failure past this point must
+        # carry the handoff information (session, run, billing state).
+        raise VastComfyError(
+            code=exc.code,
+            message=exc.message,
+            stage="prepare",
+            details={
+                **exc.details,
+                "session_id": sid,
+                "run_id": actual_run_id,
+                "lock_state": "still held by this session; NOT released automatically",
+                "instance_billing": "the instance continues to run",
+            },
+            hints=list(exc.hints) + [
+                "If the failure happened during dispatch, inspect `jobs list` for work that may have started."
+            ],
+        ) from exc
 
     final: dict[str, Any] | None = None
     summary: dict[str, Any] | None = None
@@ -393,6 +418,7 @@ def prepare_existing(
             details={
                 **exc.details,
                 "session_id": sid,
+                "job_id": job_id,
                 "run_id": actual_run_id,
                 "lock_state": "still held by this session; NOT released automatically",
                 "instance_billing": "the instance continues to run",
@@ -431,12 +457,38 @@ def prepare_existing(
     summary = remote.read_remote_json(runner, cfg, summary_path)
 
     release_result: dict | None = None
-    release_error: dict | None = None
     if release_on_success:
         try:
             release_result = locks.release(runner, cfg, sid)
         except VastComfyError as exc:
-            release_error = exc.to_dict()
+            # The smoke result is verified, but the explicitly requested session
+            # release did not happen: the flow is NOT complete and must not be
+            # reported as an overall success.
+            raise VastComfyError(
+                code=exc.code,
+                message=(
+                    "The prepare flow reached its final stage but the explicitly requested "
+                    f"session release did not happen: {exc.message}"
+                ),
+                stage="prepare",
+                details={
+                    **exc.details,
+                    "verdict": summary.get("verdict"),
+                    "instance_id": instance_id,
+                    "session_id": sid,
+                    "job_id": job_id,
+                    "run_id": actual_run_id,
+                    "summary_path": summary_path,
+                    "summary": summary,
+                    "release_error": exc.to_dict(),
+                    "lock_state": "still held by this session; NOT released",
+                    "instance_billing": "the instance continues to run",
+                },
+                hints=[
+                    "The verified smoke result above is preserved; only the session release is unresolved.",
+                    "Resolve the reported conflict, then run `vast-comfy session release` explicitly.",
+                ],
+            ) from exc
 
     return {
         "ok": True,
@@ -449,5 +501,5 @@ def prepare_existing(
         "summary_path": summary_path,
         "summary": summary,
         "release": release_result,
-        "release_error": release_error,
+        "release_error": None,
     }

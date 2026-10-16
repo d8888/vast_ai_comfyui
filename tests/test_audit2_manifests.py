@@ -112,3 +112,13 @@ def test_unsupported_fixed_seed_configuration_fails_before_payment():
     from vast_comfy.config import load_config
     with pytest.raises(VastComfyError, match="fixed-seed"):
         load_config(set_overrides={"smoke.unique_seed_per_run": False})
+
+
+def test_configured_smoke_case_timeout_reaches_the_dispatched_cases():
+    from vast_comfy.config import load_config
+
+    tuned = load_config(set_overrides={"jobs.smoke_case_timeout_minutes": 3})
+    _, _, doc = prepare.smoke_request(tuned, run_id="timeout-check")
+    assert {case["timeout_minutes"] for case in doc["cases"]} == {3}
+    _, _, default_doc = prepare.smoke_request(load_config(), run_id="timeout-default")
+    assert {case["timeout_minutes"] for case in default_doc["cases"]} == {15}

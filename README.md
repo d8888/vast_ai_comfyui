@@ -123,6 +123,7 @@ vast-comfy keys list
 
 - **公鑰必須在租用前完成註冊**：帳號金鑰只會注入「之後建立」的 instance。
 - 私鑰永遠留在控制端；已知主機檔案是獨立的 `~/.vast_comfy/known_hosts`，首次連線採 TOFU（`accept-new`），之後主機指紋改變會直接失敗，**不會**自動停用主機驗證。
+- 檔案傳輸預設走 SFTP-based `scp`；若 instance 停用 SFTP，程式只會對**安全字元集**的路徑自動退回舊協定 `-O`。含 shell 特殊字元（空白、`;`、`$`、`*` 等）的路徑一律安全拒絕，不會把路徑交給遠端 shell 解讀。
 
 ---
 
@@ -134,6 +135,7 @@ vast-comfy keys list
 
 - 未知欄位、重複 YAML key、型別／範圍／矛盾設定、未知 alias 一律在任何副作用前失敗。
 - `config/default.yaml` 是「內建預設的參考副本」，由測試確保同步。全部預設值見該檔。
+- 逾時類設定為執行期實際生效值：`jobs.smoke_case_timeout_minutes` 會套用到**每個** smoke case（覆蓋案例檔內建值），`comfy.health_timeout_seconds` 為 health 檢查的命令逾時，其餘（安裝、啟動等待、SSH 就緒、restart 等待）同樣以設定為準；修改後即為該次操作的硬性上限。
 
 常用覆寫範例：
 
@@ -286,7 +288,7 @@ vast-comfy --env-file .env session resolve-inference --instance <ID> --intent-id
 - 心跳過期只「回報」（時間、持有者、進行中工作、實際鎖狀態），**不會**自動接手。
 - 遠端工作存活期間，`flock` 實際持有，不代表過期就能插入；工作逾時只標記 `overdue` 並持續等待，**不會**代你終止。
 - ComfyUI 推論是另一個服務中的 HTTP 工作，不能靠管理程序 PID 判斷結束。smoke 逾時後背景 watcher 仍持鎖，停止後續案例，直到有可信終止證據；遲到成功也不算 `READY`。提交回應遺失不會重送。
-- 若 watcher 意外死亡或狀態無法確認，持久的待查證紀錄仍阻擋新工作、釋放與接手。這是安全拒絕，不表示 kernel flock 還有人持有；請以 `session status`／`jobs status` 的實際鎖與待查證資訊區分，交由人工查證，不刪鎖檔強行解鎖。確認 ComfyUI 佇列／history 已無該筆推論後，使用 `session resolve-inference --confirm-verified` 明確解除該筆 fence；這是唯一的人工解除路徑。
+- 若 watcher 意外死亡或狀態無法確認，持久的待查證紀錄仍阻擋新工作、釋放與接手。這是安全拒絕，不表示 kernel flock 還有人持有；請以 `session status`／`jobs status` 的實際鎖與待查證資訊區分，交由人工查證，不刪鎖檔強行解鎖。確認 ComfyUI 佇列／history 已無該筆推論後，使用 `session resolve-inference --confirm-verified` 明確解除該筆 fence；這是唯一的人工解除路徑。若紀錄檔本身損毀（無法解析的 JSON），該命令會先保留原始位元組為 `<intent-id>.unreadable-*` 再寫入解除紀錄，不會在未確認的情況下宣稱已解除。
 - 釋放前若該 session 仍有存活工作或操作進行中 → 拒絕釋放（`E_LOCK_JOBS_RUNNING`／`E_LOCK_CONFLICT`）。
 
 **為什麼不能靠刪除鎖檔解鎖？**
@@ -575,8 +577,10 @@ Python API 與 CLI 共用同一套驗證、硬條件檢查與執行邏輯；失�
 - 單元測試＋模擬整合測試（本地 mock Vast.ai REST API／SSH／ComfyUI，**不接觸真實網路與 GPU**）：
   ```bash
   .venv\Scripts\python.exe -m pytest
-  # 289 passed, 7 skipped（skipped 為 Linux-only 的 flock 實測）
+  # 874 passed, 24 skipped
+  # skipped＝Linux-only 的 flock／FD 實測（14）＋Windows 權限受限的 symlink 測試（10）
   ```
+- 經三輪獨立審計後修正並補回歸：付費請求中斷／結果不明一律保留計費與查證資訊、`stop`／`destroy` 未知結果不解除操作鎖、推論逾時後背景 watcher 持續持鎖、跨執行緒操作排他、下載／模型路徑越界、URL 憑證繞過、空白部署清單不通過驗證、舊 scp 協定路徑注入、人工推論解除命令（`session resolve-inference`）、設定逾時實際生效等；逐項證據見 `AUDIT_FIXES.md` 與 `AUDIT3_FIXES.md`。
 - 覆蓋 SPEC §17 全 19 項：設定嚴格性、alias、硬條件逐項、整合報價與上限、付費授權、不可重試的建立、SSH 與主機指紋、鎖與心跳、job 逾時語意、下載校驗、白名單部署、smoke 判定（舊圖／單色／尺寸／缺節點／busy）、JSON／exit code 契約。
 - 測試細節與範圍見 [`tests/README.md`](./tests/README.md)。
 

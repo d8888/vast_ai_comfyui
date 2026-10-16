@@ -106,7 +106,7 @@ def _prepare_runner(job_state: str, summary: dict | None) -> FakeRunner:
     runner = FakeRunner()
     # deploy_package: dirs, package verification (already present), symlink.
     runner.add_rule("mkdir", rc=0)
-    runner.add_json("verify-package", {"ok": True, "checked": 21, "problems": []})
+    runner.add_json("verify-package", {"ok": True, "checked": len(remote.build_package().records), "problems": []})
     runner.add_rule("ln -s", rc=0)
     runner.add_rule("mv -T", rc=0)
     runner.add_json("vc_session.py begin-operation", {"ok": True})
@@ -207,7 +207,7 @@ def test_prepare_existing_reads_lock_settings_from_config(cfg):
 def test_deploy_package_skips_upload_when_remote_is_verified(cfg):
     runner = FakeRunner()
     runner.add_rule("mkdir", rc=0)
-    runner.add_json("verify-package", {"ok": True, "checked": 21, "problems": []})
+    runner.add_json("verify-package", {"ok": True, "checked": len(remote.build_package().records), "problems": []})
     runner.add_rule("ln -s", rc=0)
     runner.add_rule("mv -T", rc=0)
     runner.add_json("vc_session.py begin-operation", {"ok": True})
@@ -230,7 +230,7 @@ def test_deploy_package_uploads_and_verifies_when_missing(cfg):
     runner.add_rule("mv -T", rc=0)
     runner.add_json("vc_session.py begin-operation", {"ok": True})
     runner.add_json("vc_session.py end-operation", {"ok": True})
-    runner.add_json("vc_common.py", {"ok": True, "checked": 21, "problems": []})
+    runner.add_json("vc_common.py", {"ok": True, "checked": len(remote.build_package().records), "problems": []})
 
     result = remote.deploy_package(runner, cfg, session_id="sess-1")
 
@@ -247,9 +247,26 @@ def test_deploy_package_fails_when_remote_verification_fails(cfg):
     runner.add_rule("current/remote/vc_common.py", stdout="probe-not-json\n", rc=1)
     runner.add_json("vc_session.py begin-operation", {"ok": True})
     runner.add_json("vc_session.py end-operation", {"ok": True})
-    runner.add_json("vc_common.py", {"ok": False, "checked": 21, "problems": ["sha256 mismatch: remote/vc_smoke.py"]})
+    runner.add_json("vc_common.py", {"ok": False, "checked": len(remote.build_package().records), "problems": ["sha256 mismatch: remote/vc_smoke.py"]})
 
     with pytest.raises(VastComfyError) as excinfo:
         remote.deploy_package(runner, cfg, session_id="sess-1")
     assert excinfo.value.code == "E_DEPLOY"
     assert "not trusted" in excinfo.value.message
+
+
+def test_deploy_package_rejects_verification_that_skips_expected_files(cfg):
+    runner = FakeRunner()
+    runner.add_rule("mkdir", rc=0)
+    runner.add_rule("current/remote/vc_common.py", stdout="probe-not-json\n", rc=1)
+    runner.add_json("vc_common.py", {"ok": True, "checked": 3, "problems": []})
+    runner.add_json("vc_session.py begin-operation", {"ok": True})
+    runner.add_json("vc_session.py end-operation", {"ok": True})
+
+    with pytest.raises(VastComfyError) as excinfo:
+        remote.deploy_package(runner, cfg, session_id="sess-1")
+    error = excinfo.value
+    assert error.code == "E_DEPLOY"
+    assert error.details["expected_files"] > 3
+    # The unverified package was never pointed at by `current`.
+    assert not runner.calls_containing("ln -s")

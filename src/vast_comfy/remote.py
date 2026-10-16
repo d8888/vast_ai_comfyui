@@ -228,7 +228,9 @@ def _deploy_package(runner: SSHRunner, cfg: Config, *, force: bool = False) -> d
         if probe.rc == 0:
             try:
                 payload = json.loads(probe.stdout.strip().splitlines()[-1])
-                verified_already = bool(payload.get("ok"))
+                # The verification must cover exactly the expected file set;
+                # an empty or truncated manifest is not proof of integrity.
+                verified_already = bool(payload.get("ok")) and payload.get("checked") == len(info.records)
             except (ValueError, IndexError):
                 verified_already = False
 
@@ -269,12 +271,15 @@ def _deploy_package(runner: SSHRunner, cfg: Config, *, force: bool = False) -> d
                 stage="deploy",
                 details={"rc": verify.rc, "stdout_excerpt": verify.stdout[-300:].strip()},
             ) from exc
-        if verify.rc != 0 or not payload.get("ok"):
+        if verify.rc != 0 or not payload.get("ok") or payload.get("checked") != len(info.records):
             raise VastComfyError(
                 code=E_DEPLOY,
-                message="Remote package verification failed; the deployment is not trusted",
+                message=(
+                    "Remote package verification failed or did not cover every expected file; "
+                    "the deployment is not trusted"
+                ),
                 stage="deploy",
-                details={"rc": verify.rc, "verify": payload},
+                details={"rc": verify.rc, "verify": payload, "expected_files": len(info.records)},
             )
 
     # Point `current` at the verified package (atomic symlink swap).

@@ -47,6 +47,11 @@ _CONNECT_PATTERNS = (
     "connection closed",
 )
 
+# Shell-safe charset for the legacy scp protocol (-O): it hands the remote path
+# to the server's shell unquoted, so any other character must never be passed
+# to -O (metacharacters could execute commands on the instance).
+_LEGACY_SCP_PATH = re.compile(r"[A-Za-z0-9._/+:@%,=-]+\Z")
+
 
 @dataclass
 class SSHContext:
@@ -383,12 +388,14 @@ class SSHRunner:
     # -- file transfer ----------------------------------------------------
 
     def upload(self, local_path: Path | str, remote_path: str) -> None:
-        self._scp([str(local_path), f"{self.ctx.user}@{self.ctx.host}:{remote_path}"], direction="upload")
+        self._scp([str(local_path), f"{self.ctx.user}@{self.ctx.host}:{remote_path}"],
+                  direction="upload", remote_path=remote_path)
 
     def download(self, remote_path: str, local_path: Path | str) -> None:
-        self._scp([f"{self.ctx.user}@{self.ctx.host}:{remote_path}", str(local_path)], direction="download")
+        self._scp([f"{self.ctx.user}@{self.ctx.host}:{remote_path}", str(local_path)],
+                  direction="download", remote_path=remote_path)
 
-    def _scp(self, operands: list[str], *, direction: str) -> None:
+    def _scp(self, operands: list[str], *, direction: str, remote_path: str) -> None:
         def args(legacy: bool) -> list[str]:
             base = scp_base_args(self.ctx)
             if legacy:
@@ -396,6 +403,22 @@ class SSHRunner:
             return [*base, *operands]
 
         for legacy in (False, True):
+            if legacy and not _LEGACY_SCP_PATH.fullmatch(remote_path):
+                # Legacy scp (-O) sends the path to the remote shell unquoted.
+                raise VastComfyError(
+                    code=E_SSH_COMMAND,
+                    message=(
+                        "The SFTP-based scp failed and the remote path contains characters that "
+                        "are unsafe for the legacy scp protocol; the -O fallback was refused."
+                    ),
+                    stage="ssh",
+                    details={"direction": direction, "path_excerpt": _scrub_tail(remote_path, 120)},
+                    hints=[
+                        "Legacy scp passes the path to the remote shell unquoted; metacharacters "
+                        "could execute commands on the instance.",
+                        "Rename the file to safe characters, or keep the SFTP subsystem enabled.",
+                    ],
+                )
             full = args(legacy)
             if self.dry_run:
                 logger.info("dry-run scp: %s", shlex.join(full))

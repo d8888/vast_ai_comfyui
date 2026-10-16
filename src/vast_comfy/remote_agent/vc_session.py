@@ -432,10 +432,11 @@ def cmd_resolve_inference(args) -> None:
         intent_id = C.validate_identifier(args.intent_id, "intent id")
     except ValueError:
         C.fail("E_USAGE", "Invalid intent id.")
-    record = C.read_json(C.confined_path(C.INFERENCE_DIR, intent_id + ".json"), default=None)
-    if not isinstance(record, dict):
+    path = C.confined_path(C.INFERENCE_DIR, intent_id + ".json")
+    record = C.read_json(path, default=None)
+    if record is None and not (path.exists() or path.is_symlink()):
         C.fail("E_USAGE", f"No such inference intent: {intent_id}")
-    if record.get("state") in ("terminal", "rejected"):
+    if isinstance(record, dict) and C.inference_resolved(record):
         C.emit({"ok": True, "intent_id": intent_id, "already_resolved": True})
         return
     if not args.confirm_verified:
@@ -446,13 +447,27 @@ def cmd_resolve_inference(args) -> None:
             exit_code=21,
             intent_id=intent_id,
         )
+    archived = None
+    if record is None:
+        # The record is unreadable (corrupt JSON, dangling link, ...). Preserve
+        # the raw bytes under a name the fence never reads, then replace it with
+        # the operator's resolution. os.replace moves a symlink itself, never
+        # the link target.
+        archived = f"{intent_id}.unreadable-{os.urandom(4).hex()}"
+        os.replace(path, C.confined_path(C.INFERENCE_DIR, archived))
+        record = {"intent_id": intent_id}
     record.update(state="rejected", rejection_confirmed=True, resolved_by="operator",
                   resolved_at=C.now_epoch(), note=str(args.note or ""))
+    if archived:
+        record["replaced_unreadable_record"] = archived
     C.write_inference(record)
-    C.emit({
+    payload = {
         "ok": True, "intent_id": intent_id, "resolved": True,
         "warning": "No automatic check was possible; this records the operator's confirmation that the work ended.",
-    })
+    }
+    if archived:
+        payload["replaced_unreadable_record"] = archived
+    C.emit(payload)
 
 
 def build_parser() -> argparse.ArgumentParser:

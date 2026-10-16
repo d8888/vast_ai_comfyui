@@ -256,6 +256,29 @@ def reserve_run_directory(run_id: str, *, stage: str, from_prepare: bool = False
     return path
 
 
+def inference_resolved(record) -> bool:
+    """True only when the record carries positive completion evidence.
+
+    A terminal/rejected state without evidence is UNKNOWN and keeps the fence;
+    only the watcher or the operator's explicit resolution may end it.
+    """
+    if not isinstance(record, dict) or record.get("state") not in ("terminal", "rejected"):
+        return False
+    if record.get("state") == "rejected" and record.get("rejection_confirmed") is True:
+        return True
+    status = record.get("terminal_status")
+    if not isinstance(status, dict) or not isinstance(record.get("prompt_id"), str):
+        return False
+    messages = status.get("messages")
+    execution_error = isinstance(messages, list) and any(
+        isinstance(item, (list, tuple)) and len(item) == 2
+        and item[0] in ("execution_error", "execution_interrupted") for item in messages
+    )
+    return (status.get("status_str") in ("error", "failed", "interrupted")
+            or (status.get("completed") is True and status.get("status_str") == "success")
+            or execution_error)
+
+
 def pending_inferences(*, session_id=None, operation_token=None, job_id=None) -> list[dict]:
     """Persistent safety fence, independent of kernel locks and watcher PIDs.
 
@@ -271,17 +294,7 @@ def pending_inferences(*, session_id=None, operation_token=None, job_id=None) ->
             records.append({"intent_id": path.stem, "state": "unknown", "record_unreadable": True})
             continue
         if record["state"] in ("terminal", "rejected"):
-            status = record.get("terminal_status")
-            messages = status.get("messages") if isinstance(status, dict) else None
-            execution_error = isinstance(messages, list) and any(
-                isinstance(item, (list, tuple)) and len(item) == 2
-                and item[0] in ("execution_error", "execution_interrupted") for item in messages
-            )
-            terminal = (isinstance(record.get("prompt_id"), str) and isinstance(status, dict)
-                        and (status.get("status_str") in ("error", "failed", "interrupted")
-                             or (status.get("completed") is True and status.get("status_str") == "success")
-                             or execution_error))
-            if terminal or (record["state"] == "rejected" and record.get("rejection_confirmed") is True):
+            if inference_resolved(record):
                 continue
             records.append({"intent_id": path.stem, "state": "unknown", "record_unreadable": True})
             continue
@@ -546,10 +559,11 @@ def cmd_verify_package(args) -> None:
     manifest = Path(args.manifest)
     if not manifest.is_file():
         fail("E_DEPLOY", f"manifest not found: {manifest}", exit_code=1)
-    for raw_line in manifest.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
+    entries = [line.strip() for line in manifest.read_text(encoding="utf-8").splitlines()]
+    entries = [line for line in entries if line]
+    if not entries:
+        problems.append("manifest contains no entries")
+    for line in entries:
         sha_expected, _, rel = line.partition("  ")
         if not sha_expected or not rel:
             problems.append(f"malformed manifest line: {line!r}")
@@ -562,7 +576,8 @@ def cmd_verify_package(args) -> None:
         if actual != sha_expected:
             problems.append(f"sha256 mismatch: {rel}")
         checked += 1
-    emit({"ok": not problems, "checked": checked, "problems": problems})
+    emit({"ok": not problems, "checked": checked, "problems": problems},
+         exit_code=0 if not problems else 1)
 
 
 def cmd_instance_time(args) -> None:

@@ -226,8 +226,14 @@ def evaluate_offer(offer: dict[str, Any], cfg: Config, spec: AliasSpec) -> list[
     exclude = cfg.require("host.geolocation_exclude") or []
     if allow and (country is None or country not in allow):
         reasons.append(f"geolocation {offer.get('geolocation')!r} not in allow list")
-    if exclude and country is not None and country in exclude:
-        reasons.append(f"geolocation {offer.get('geolocation')!r} is excluded")
+    if exclude:
+        if country is None:
+            reasons.append(
+                f"geolocation {offer.get('geolocation')!r} could not be determined; "
+                "the configured exclusions cannot be verified"
+            )
+        elif country in exclude:
+            reasons.append(f"geolocation {offer.get('geolocation')!r} is excluded")
 
     if "dph_total" in numeric_ok:
         cap = float(cfg.require("pricing.max_dph_total_usd_per_hour"))

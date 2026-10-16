@@ -26,7 +26,13 @@ def health(runner: SSHRunner, cfg: Config, session_id: str, *, gpu: bool = False
     argv = ["health", "--session-id", session_id, "--comfy-url", _comfy_url(cfg)]
     if gpu:
         argv.append("--gpu")
-    return invoke(runner, cfg, "vc_comfy.py", argv, timeout_seconds=180)
+    return invoke(
+        runner,
+        cfg,
+        "vc_comfy.py",
+        argv,
+        timeout_seconds=int(cfg.require("comfy.health_timeout_seconds")),
+    )
 
 
 def restart(runner: SSHRunner, cfg: Config, session_id: str) -> dict:

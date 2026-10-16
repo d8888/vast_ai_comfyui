@@ -101,6 +101,13 @@ def test_geolocation_exclude(mapping):
     assert ok == []
 
 
+def test_geolocation_exclude_fails_closed_on_unknown_locations(mapping):
+    reasons = evaluate(mapping, make_offer(geolocation=MISSING), **{"host.geolocation_exclude": ["CN"]})
+    assert any("could not be determined" in r for r in reasons)
+    reasons = evaluate(mapping, make_offer(geolocation="Moon"), **{"host.geolocation_exclude": ["CN"]})
+    assert any("could not be determined" in r for r in reasons)
+
+
 # ---------------------------------------------------------------------------
 # Missing fields are never guessed
 # ---------------------------------------------------------------------------

@@ -200,6 +200,59 @@ def test_execute_dry_run_does_not_spawn(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Legacy scp fallback: never hand shell-metacharacter paths to the remote shell
+# ---------------------------------------------------------------------------
+
+
+class _Completed:
+    def __init__(self, rc: int, stderr: bytes = b"") -> None:
+        self.returncode = rc
+        self.stdout = b""
+        self.stderr = stderr
+
+
+_SFTP_FAILURE = b"subsystem request failed on channel 0\nscp: sftp unavailable"
+
+
+def test_legacy_scp_fallback_refuses_shell_metacharacter_paths(tmp_path, monkeypatch):
+    ctx = make_ctx(tmp_path)
+    runner = SSHRunner(ctx)
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        return _Completed(1, stderr=_SFTP_FAILURE)
+
+    monkeypatch.setattr("vast_comfy.ssh.subprocess.run", fake_run)
+    with pytest.raises(VastComfyError) as excinfo:
+        runner.download("/workspace/ComfyUI/output/probe;id.png", str(tmp_path / "local.bin"))
+    error = excinfo.value
+    assert error.code == "E_SSH_COMMAND"
+    assert "legacy" in error.message.lower()
+    # Only the SFTP attempt ran; -O was refused before spawning anything.
+    assert len(calls) == 1
+    assert "-O" not in calls[0]
+
+
+def test_legacy_scp_fallback_is_still_used_for_safe_paths(tmp_path, monkeypatch):
+    ctx = make_ctx(tmp_path)
+    runner = SSHRunner(ctx)
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        if len(calls) == 1:
+            return _Completed(1, stderr=_SFTP_FAILURE)
+        return _Completed(0)
+
+    monkeypatch.setattr("vast_comfy.ssh.subprocess.run", fake_run)
+    runner.download("/workspace/ComfyUI/output/vast_probe.png", str(tmp_path / "local.bin"))
+    assert len(calls) == 2
+    assert "-O" in calls[1]
+    assert "root@ssh5.vast.ai:/workspace/ComfyUI/output/vast_probe.png" in calls[1]
+
+
+# ---------------------------------------------------------------------------
 # Secret scrubbing
 # ---------------------------------------------------------------------------
 

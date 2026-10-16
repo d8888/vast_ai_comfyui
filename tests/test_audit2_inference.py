@@ -375,3 +375,36 @@ def test_cli_resolve_inference_requires_flag_and_passes_runner(cfg, monkeypatch)
         ["session", "resolve-inference", "--instance", "1", "--intent-id", "i1", "--confirm-verified"])
     cli.cmd_session_resolve_inference(ctx, args)
     backend.assert_called_once_with(runner, cfg, "i1", confirm_verified=True)
+
+
+def test_resolve_inference_fixes_evidence_free_terminal_records(remote_agent, monkeypatch):
+    common = remote_agent.C
+    session = importlib.import_module("vc_session")
+    common.write_inference({"intent_id": "broken", "state": "terminal"})
+    output = Mock(); monkeypatch.setattr(common, "emit", output)
+    session.cmd_resolve_inference(SimpleNamespace(intent_id="broken", confirm_verified=True, note=""))
+    payload = output.call_args.args[0]
+    assert payload["resolved"] is True and "already_resolved" not in payload
+    record = common.read_json(common.INFERENCE_DIR / "broken.json")
+    assert record["state"] == "rejected" and record["rejection_confirmed"] is True
+    assert not common.pending_inferences()
+
+
+def test_resolve_inference_preserves_and_replaces_unreadable_records(remote_agent, monkeypatch):
+    common = remote_agent.C
+    session = importlib.import_module("vc_session")
+    common.INFERENCE_DIR.mkdir(parents=True)
+    (common.INFERENCE_DIR / "corrupt.json").write_text("not json at all")
+    with pytest.raises(common.RemoteFail) as error:
+        session.cmd_resolve_inference(SimpleNamespace(intent_id="corrupt", confirm_verified=False, note=""))
+    assert error.value.code == "E_APPROVAL_REQUIRED"
+    assert (common.INFERENCE_DIR / "corrupt.json").read_text() == "not json at all"
+    output = Mock(); monkeypatch.setattr(common, "emit", output)
+    session.cmd_resolve_inference(SimpleNamespace(intent_id="corrupt", confirm_verified=True, note=""))
+    payload = output.call_args.args[0]
+    archived = payload["replaced_unreadable_record"]
+    assert not archived.endswith(".json")
+    assert (common.INFERENCE_DIR / archived).read_text() == "not json at all"
+    record = common.read_json(common.INFERENCE_DIR / "corrupt.json")
+    assert record["state"] == "rejected" and record["replaced_unreadable_record"] == archived
+    assert not common.pending_inferences()

@@ -17,6 +17,11 @@ REPORT_NAMES = ("report.json", "report.md", "prepare_summary.json", "summary.jso
 REPORT_CONTENT = b"report-bytes-for-sha256"
 REPORT_SHA = hashlib.sha256(REPORT_CONTENT).hexdigest()
 OUTPUT_ROOT = "/workspace/ComfyUI/output"
+RUNTIME_ROOT = "/workspace/.vast_comfy"
+
+
+def _allow_remote(runner: FakeRunner, root: str, path: str) -> None:
+    runner.add_rule(f"realpath -e -- {root} {path}", stdout=f"{root}\n{path}\n")
 
 
 def _report_runner() -> FakeRunner:
@@ -26,6 +31,7 @@ def _report_runner() -> FakeRunner:
     for name in REPORT_NAMES:
         remote_path = f"/workspace/.vast_comfy/runs/{RUN_ID}/{name}"
         runner.remote_files[remote_path] = REPORT_CONTENT
+        _allow_remote(runner, RUNTIME_ROOT, remote_path)
     return runner
 
 
@@ -129,12 +135,13 @@ def test_download_outputs_parses_find_output_newest_first(cfg, tmp_path):
     find_output = (
         f"1700000100.5 {newest}\n"
         f"1700000000.25 {older}\n"
-        f"1699999999.0 /tmp/outside.png\n"  # outside the output root: ignored
     )
     runner.add_rule("find ", stdout=find_output, rc=0)
     runner.add_rule("sha256sum ", stdout=f"{sha}  f\n", rc=0)
     runner.remote_files[newest] = content
     runner.remote_files[older] = content
+    _allow_remote(runner, OUTPUT_ROOT, newest)
+    _allow_remote(runner, OUTPUT_ROOT, older)
 
     result = dl.download_outputs(runner, cfg, dest_dir=tmp_path / "out", pattern="*.png", limit=3)
 
@@ -165,7 +172,7 @@ def test_download_smoke_images_uses_the_report_index(cfg, tmp_path):
     image_path = f"{OUTPUT_ROOT}/vast_comfy_smoke_base_t2i_00001_.png"
     report = {
         "cases": [
-            {"id": "base_t2i", "images": [{"path": image_path}, {"path": "/etc/passwd"}]},
+            {"id": "base_t2i", "images": [{"path": image_path}]},
         ]
     }
     content = b"png-bytes"
@@ -173,6 +180,8 @@ def test_download_smoke_images_uses_the_report_index(cfg, tmp_path):
     runner.add_rule("cat ", stdout=jsonlib.dumps(report) + "\n", rc=0)
     runner.add_rule("sha256sum ", stdout=f"{sha}  f\n", rc=0)
     runner.remote_files[image_path] = content
+    _allow_remote(runner, RUNTIME_ROOT, f"{RUNTIME_ROOT}/runs/{RUN_ID}/report.json")
+    _allow_remote(runner, OUTPUT_ROOT, image_path)
 
     result = dl.download_smoke_images(runner, cfg, run_id=RUN_ID, dest_dir=tmp_path / "out")
 

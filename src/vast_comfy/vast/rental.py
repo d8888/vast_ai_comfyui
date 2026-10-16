@@ -9,6 +9,8 @@ Guarantees:
 
 from __future__ import annotations
 
+import contextlib
+import re
 import time
 from typing import Any, Callable
 
@@ -23,7 +25,7 @@ from ..errors import (
     VastComfyError,
 )
 from ..gpu import AliasSpec
-from ..ssh import rental_preflight
+from ..ssh import rental_preflight, wait_for_ssh
 from .client import VastClient, scrub
 from .offers import build_search_query, evaluate_offer, quote_from_offer
 
@@ -129,34 +131,41 @@ def create_instance(
 
     rental_preflight(client, cfg)
     body = build_create_body(cfg, label)
+    since_epoch = time.time()
+
+    def uncertain(*, cause=None, response_keys=None):
+        details = {"offer_id": int(offer["id"]), "label": label,
+                   "since_epoch": since_epoch, "instance_may_be_billing": True}
+        if cause is not None:
+            details["cause"] = cause
+        if response_keys is not None:
+            details["response_keys"] = response_keys
+        return VastComfyError(
+            code="E_CREATE_UNCERTAIN",
+            message="The create request outcome is UNKNOWN and was NOT retried; an instance may exist.",
+            stage="rent", details=details,
+            hints=[f"Verify before doing anything else: vast-comfy rent verify --label {label!r}",
+                   "Do NOT resend the create request blindly — that can double-charge."],
+        )
+
     try:
         response = client.create_instance(int(offer["id"]), body)
     except VastComfyError as exc:
         status_code = exc.details.get("status")
-        ambiguous = exc.code == E_NETWORK or (
-            exc.code == E_UPSTREAM and (status_code is None or status_code >= 500)
-        )
+        ambiguous = exc.code == E_NETWORK or (exc.code == E_UPSTREAM and (
+            type(status_code) is not int or status_code >= 500 or status_code == 408))
         if ambiguous:
-            raise VastComfyError(
-                code="E_CREATE_UNCERTAIN",
-                message=(
-                    "The create request outcome is UNKNOWN (network or server failure). "
-                    "It was NOT retried; the instance may or may not exist."
-                ),
-                stage="rent",
-                details={"offer_id": int(offer["id"]), "label": label, "cause": exc.to_dict(),
-                         "since_epoch": time.time(), "instance_may_be_billing": True},
-                hints=[
-                    f"Verify before doing anything else: vast-comfy rent verify --label {label!r}",
-                    "Do NOT resend the create request blindly — that can double-charge.",
-                ],
-            ) from exc
+            raise uncertain(cause=exc.to_dict()) from exc
         raise
+    except Exception as exc:
+        # A client/response-decoding failure after dispatch is not evidence of
+        # rejection. Do not expose exception text, which may include credentials.
+        raise uncertain(cause={"error_type": type(exc).__name__}) from exc
 
-    if not isinstance(response, dict) or not response.get("success"):
-        api_message = ""
-        if isinstance(response, dict):
-            api_message = scrub(str(response.get("msg", response.get("error", ""))))
+    if not isinstance(response, dict):
+        raise uncertain()
+    if response.get("success") is False and response.get("new_contract") is None:
+        api_message = scrub(str(response.get("msg", response.get("error", ""))))
         raise VastComfyError(
             code=E_UPSTREAM,
             message=f"Vast.ai did not accept the create request: {api_message or 'unknown error'}",
@@ -165,19 +174,41 @@ def create_instance(
         )
 
     new_contract = response.get("new_contract")
-    if not new_contract:
-        raise VastComfyError(
-            code="E_CREATE_UNCERTAIN",
-            message=(
-                "The create response did not include a new_contract id; the outcome is UNCERTAIN "
-                "and was NOT retried."
-            ),
-            stage="rent",
-            details={"offer_id": int(offer["id"]), "label": label, "response_keys": sorted(response.keys())},
-            hints=[f"Verify with: vast-comfy rent verify --label {label!r}"],
-        )
+    valid_id = type(new_contract) is int and new_contract > 0
+    if isinstance(new_contract, str) and re.fullmatch(r"[0-9]{1,20}", new_contract):
+        valid_id = int(new_contract) > 0
+    if response.get("success") is not True or not valid_id:
+        raise uncertain(response_keys=sorted(str(key) for key in response))
 
     return {"instance_id": int(new_contract), "label": label, "offer_id": int(offer["id"])}
+
+
+@contextlib.contextmanager
+def created_resource(created: dict):
+    """Keep billing/resource references on EVERY failure after paid creation."""
+    try:
+        yield
+    except Exception as exc:
+        error = exc if isinstance(exc, VastComfyError) else VastComfyError(
+            code="E_INTERNAL", message="A post-create operation failed; the instance may still be billing.",
+            stage="post_create", details={"error_type": type(exc).__name__})
+        error.details.setdefault("instance_id", created["instance_id"])
+        error.details.setdefault("label", created.get("label"))
+        error.details.setdefault("instance_may_be_billing", True)
+        error.details.setdefault("instance_billing", "Created; NOT stopped or destroyed. Inspect the Vast.ai console.")
+        if error is exc:
+            raise
+        raise error from exc
+
+
+def wait_created(client, cfg: Config, created: dict, *, on_poll=None):
+    """Shared CLI/API post-create readiness, including bounded SSH retries."""
+    from ..instances import runner_for
+    with created_resource(created):
+        instance = wait_for_running(client, created["instance_id"], cfg, on_poll=on_poll)
+        runner = runner_for(instance, cfg)
+        ssh = wait_for_ssh(runner, cfg)
+        return instance, runner, ssh
 
 
 def verify_creation(

@@ -20,6 +20,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 RUNTIME_DIR = Path(os.environ.get("VAST_COMFY_RUNTIME_DIR", "/workspace/.vast_comfy"))
 COMFY_DIR = Path(os.environ.get("VAST_COMFY_COMFY_DIR", "/workspace/ComfyUI"))
@@ -32,6 +33,7 @@ OWNER_HISTORY = LOCK_DIR / "owner_history.jsonl"
 RELEASE_REQUEST = LOCK_DIR / "release.request"
 OPERATION_FILE = LOCK_DIR / "operation.lock"
 OPERATION_OWNER = LOCK_DIR / "operation.json"
+INFERENCE_DIR = LOCK_DIR / "inference"
 JOBS_DIR = RUNTIME_DIR / "jobs"
 RUNS_DIR = RUNTIME_DIR / "runs"
 DOWNLOADS_DIR = RUNTIME_DIR / "downloads"
@@ -95,6 +97,20 @@ def fail(code: str, message: str, *, exit_code: int = 1, **details: object) -> N
 
 def redact(text: str) -> str:
     text = re.sub(r"(?i)(bearer\s+)\S+", r"\1<redacted>", str(text))
+    text = re.sub(r"(?i)(https?://)[^\s/?#]*(?:@|%(?:25){0,2}40)", r"\1<redacted>@", text)
+
+    def query_secret(match):
+        key = match.group(2)
+        for _ in range(3):
+            key = unquote(key)
+        key = key.lower().replace("-", "_")
+        if any(word in key for word in ("token", "api_key", "apikey", "password", "secret")):
+            return match.group(1) + match.group(2) + match.group(3) + "<redacted>"
+        return match.group(0)
+
+    text = re.sub(r"(?i)([?&]|%(?:25){0,2}3f|%(?:25){0,2}26)([^=&#\s]+?)(=|%(?:25){0,2}3d)"
+                  r"((?:(?!%(?:25){0,2}(?:26|23))[^&#\s])*)",
+                  query_secret, text)
     for name, value in os.environ.items():
         if len(value) >= 8 and any(word in name.upper() for word in ("TOKEN", "PASSWORD", "SECRET", "API_KEY")):
             text = text.replace(value, "<redacted>")
@@ -126,7 +142,15 @@ def atomic_write_json(path: Path, payload: dict) -> None:
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(payload, fh, indent=2, sort_keys=True)
         fh.write("\n")
+        fh.flush()
+        os.fsync(fh.fileno())
     os.replace(tmp, path)
+    if os.name == "posix":
+        fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
 
 
 def read_json(path: Path, default=None):
@@ -170,6 +194,122 @@ def pid_alive(pid: int | None) -> bool:
     except PermissionError:
         return True
     return True
+
+
+def validate_identifier(value, label: str = "identifier") -> str:
+    """Portable, single-component identifiers; never normalize an unsafe value."""
+    if (not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", value)
+            or value.endswith(".") or re.fullmatch(r"(?i)(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])",
+                                                   value.split(".", 1)[0])):
+        raise ValueError(f"unsafe {label}: {value!r}")
+    return value
+
+
+def confined_path(root: Path, rel: str) -> Path:
+    if (not isinstance(rel, str) or not rel or any(c in rel for c in ("\\", ":", "\0"))
+            or any(part in ("", ".", "..") for part in rel.split("/"))
+            or any(ord(c) < 32 or ord(c) == 127 for c in rel)):
+        raise ValueError(f"unsafe relative path: {rel!r}")
+    root = Path(root)
+    path = root / rel
+    if not path.resolve().is_relative_to(root.resolve()):
+        raise ValueError(f"path escapes its directory: {rel!r}")
+    return path
+
+
+def validate_public_url(url) -> str:
+    if (not isinstance(url, str) or not url or any(ord(c) <= 32 or ord(c) >= 127 for c in url)
+            or any(c in url for c in ("%", "\\", "?", "#"))):
+        raise ValueError("URL must be credential-free, unencoded HTTPS without query or fragment")
+    parsed = urlsplit(url)
+    if (parsed.scheme != "https" or not parsed.hostname or parsed.username is not None
+            or parsed.password is not None or "@" in parsed.netloc or parsed.port not in (None, 443)
+            or not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?", parsed.hostname)
+            or any(not label or label.startswith("-") or label.endswith("-")
+                   for label in parsed.hostname.split("."))):
+        raise ValueError("URL must be credential-free HTTPS on the default port")
+    if parsed.path not in ("", "/") and any(
+        part in ("", ".", "..") or not re.fullmatch(r"[A-Za-z0-9_.~-]+", part)
+        for part in parsed.path.removeprefix("/").split("/")
+    ):
+        raise ValueError("URL path must contain safe ASCII components")
+    return url
+
+
+def reserve_run_directory(run_id: str, *, stage: str, from_prepare: bool = False) -> Path:
+    """Claim a run once, including failures; never overwrite evidence from a retry."""
+    try:
+        validate_identifier(run_id, "run id")
+        path = confined_path(RUNS_DIR, run_id)
+        RUNS_DIR.mkdir(parents=True, exist_ok=True)
+        if from_prepare:
+            claim = read_json(confined_path(path, ".prepare.claim"), {})
+            if not isinstance(claim, dict) or claim.get("token") != os.environ.get("VAST_COMFY_OPERATION_TOKEN"):
+                raise ValueError("run was not reserved by this prepare operation")
+        else:
+            path.mkdir(exist_ok=False)
+        marker = confined_path(path, f".{stage}.claim")
+        with marker.open("x", encoding="utf-8") as fh:
+            json.dump({"token": os.environ.get("VAST_COMFY_OPERATION_TOKEN"), "created_at": now_epoch()}, fh)
+    except (ValueError, FileExistsError) as exc:
+        fail("E_USAGE", f"Invalid or already used run id: {exc}")
+    return path
+
+
+def pending_inferences(*, session_id=None, operation_token=None, job_id=None) -> list[dict]:
+    """Persistent safety fence, independent of kernel locks and watcher PIDs.
+
+    Unreadable/malformed records are UNKNOWN and block every session. Only the
+    watcher may record terminal/rejected after obtaining positive evidence.
+    """
+    if not INFERENCE_DIR.exists():
+        return []
+    records = []
+    for path in sorted(INFERENCE_DIR.glob("*.json")):
+        record = read_json(path)
+        if not isinstance(record, dict) or not isinstance(record.get("state"), str):
+            records.append({"intent_id": path.stem, "state": "unknown", "record_unreadable": True})
+            continue
+        if record["state"] in ("terminal", "rejected"):
+            status = record.get("terminal_status")
+            messages = status.get("messages") if isinstance(status, dict) else None
+            execution_error = isinstance(messages, list) and any(
+                isinstance(item, (list, tuple)) and len(item) == 2
+                and item[0] in ("execution_error", "execution_interrupted") for item in messages
+            )
+            terminal = (isinstance(record.get("prompt_id"), str) and isinstance(status, dict)
+                        and (status.get("status_str") in ("error", "failed", "interrupted")
+                             or (status.get("completed") is True and status.get("status_str") == "success")
+                             or execution_error))
+            if terminal or (record["state"] == "rejected" and record.get("rejection_confirmed") is True):
+                continue
+            records.append({"intent_id": path.stem, "state": "unknown", "record_unreadable": True})
+            continue
+        if any(value is not None and record.get(key) != value for key, value in (
+            ("session_id", session_id), ("operation_token", operation_token), ("job_id", job_id)
+        )):
+            continue
+        records.append(record)
+    return records
+
+
+def assert_no_pending_inferences() -> None:
+    pending = pending_inferences()
+    if pending:
+        fail("E_LOCK_JOBS_RUNNING", "Unresolved HTTP inference remains; no unlock or takeover is safe.",
+             exit_code=4, pending_inferences=pending, persistent_hold=True, takeover_required=True)
+
+
+def write_inference(record: dict) -> None:
+    intent_id = validate_identifier(record["intent_id"], "inference intent id")
+    atomic_write_json(confined_path(INFERENCE_DIR, intent_id + ".json"), record)
+
+
+def write_job_progress(payload: dict) -> None:
+    job_id = os.environ.get("VAST_COMFY_JOB_ID")
+    if job_id:
+        directory = confined_path(JOBS_DIR, validate_identifier(job_id, "job id"))
+        atomic_write_json(confined_path(directory, "progress.json"), {**payload, "updated_at": now_epoch()})
 
 
 def validate_model_relpath(rel: str) -> str:
@@ -277,14 +417,22 @@ class OperationLease:
         self.fd, self.token, self.handed_off = fd, token, False
 
     def handoff(self):
+        if self.fd is None:
+            fail("E_LOCK_NOT_HELD", "A token-only lease cannot hand off a kernel lock to a job.", exit_code=4)
         self.handed_off = True
 
 
-def finish_operation(token: str) -> None:
+def finish_operation(token: str) -> bool:
     owner = read_json(OPERATION_OWNER, {}) or {}
     if owner.get("token") == token:
+        if pending_inferences():
+            owner.update(persistent_hold=True)
+            atomic_write_json(OPERATION_OWNER, owner)
+            return False
         owner.update(state="released", ended_at=now_epoch())
+        owner["persistent_hold"] = False
         atomic_write_json(OPERATION_OWNER, owner)
+    return True
 
 
 def check_deadline() -> None:
@@ -302,8 +450,9 @@ def operation(session_id: str, *, label: str = "operation", token: str | None = 
     same session fails too. Jobs inherit the descriptor so controller disconnect
     or session-daemon death cannot remove their actual exclusion.
     """
-    import fcntl
     ensure_dirs()
+    assert_no_pending_inferences()
+    import fcntl
     delegated = os.environ.get("VAST_COMFY_OPERATION_TOKEN")
     if delegated:
         record = read_json(OPERATION_OWNER, {}) or {}
@@ -319,7 +468,7 @@ def operation(session_id: str, *, label: str = "operation", token: str | None = 
                 fail("E_LOCK_NOT_HELD", "The inherited operation descriptor is gone.", exit_code=4)
             if (actual.st_dev, actual.st_ino) != (expected.st_dev, expected.st_ino):
                 fail("E_LOCK_NOT_HELD", "Inherited operation descriptor does not match the lock.", exit_code=4)
-        yield OperationLease(None, delegated)
+        yield OperationLease(int(raw_fd) if raw_fd else None, delegated)
         return
     fd = os.open(OPERATION_FILE, os.O_RDWR | os.O_CREAT, 0o600)
     lease = OperationLease(fd, token or uuid.uuid4().hex)
@@ -334,6 +483,7 @@ def operation(session_id: str, *, label: str = "operation", token: str | None = 
             fail("E_LOCK_CONFLICT", "Another operation is running, including in this session.",
                  exit_code=4, operation=read_json(OPERATION_OWNER, {}))
         ensure_owns(session_id)
+        assert_no_pending_inferences()
         alive = session_jobs(session_id, alive_only=True)
         if alive:
             fail("E_LOCK_JOBS_RUNNING", "Existing remote work is still alive.", exit_code=4, jobs=alive)
@@ -349,9 +499,11 @@ def operation(session_id: str, *, label: str = "operation", token: str | None = 
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
-        if acquired and not lease.handed_off:
-            finish_operation(lease.token)
-        os.close(fd)  # Do not LOCK_UN: a handed-off descriptor belongs to the job.
+        try:
+            if acquired and not lease.handed_off:
+                finish_operation(lease.token)
+        finally:
+            os.close(fd)  # Do not LOCK_UN: a handed-off descriptor belongs to the job.
 
 
 def session_jobs(session_id: str, *, alive_only: bool = False) -> list:
@@ -374,7 +526,8 @@ def session_jobs(session_id: str, *, alive_only: bool = False) -> list:
             "pid_alive": pid_alive(pid) if pid else False,
         }
         record["runner_alive"] = pid_alive(meta.get("pid"))
-        if alive_only and not (record["pid_alive"] or record["runner_alive"]):
+        record["persistent_hold"] = bool(pending_inferences(job_id=meta.get("job_id")))
+        if alive_only and not (record["pid_alive"] or record["runner_alive"] or record["persistent_hold"]):
             continue
         records.append(record)
     return records

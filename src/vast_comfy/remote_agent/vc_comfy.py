@@ -69,9 +69,13 @@ def check_health(base_url: str) -> dict:
 
 
 def queue_snapshot(base_url: str) -> dict:
-    payload = http_json(f"{base_url}/queue", timeout=10.0) or {}
-    running = payload.get("queue_running") or []
-    pending = payload.get("queue_pending") or []
+    payload = http_json(f"{base_url}/queue", timeout=10.0)
+    if not isinstance(payload, dict) or any(
+        not isinstance(payload.get(key), list) for key in ("queue_running", "queue_pending")
+    ):
+        C.fail("E_COMFY_UNAVAILABLE", "ComfyUI returned an invalid queue schema; idle state is UNKNOWN.")
+    running = payload["queue_running"]
+    pending = payload["queue_pending"]
     return {"running": len(running), "pending": len(pending), "busy": bool(running or pending)}
 
 

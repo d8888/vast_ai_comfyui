@@ -159,7 +159,8 @@ def bootstrap_dir(cfg: Config) -> str:
 def remote_environment(cfg: Config, runner=None) -> list[str]:
     env = ["env", f"VAST_COMFY_RUNTIME_DIR={runtime_root(cfg)}",
            f"VAST_COMFY_COMFY_DIR={cfg.require('image.comfyui_dir')}"]
-    token = getattr(runner, "_vast_operation_token", None) if runner is not None else None
+    from .locks import operation_token
+    token = operation_token(runner) if runner is not None else None
     if isinstance(token, str):
         env += [f"VAST_COMFY_OPERATION_TOKEN={token}"]
     return env

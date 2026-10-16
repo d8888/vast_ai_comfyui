@@ -272,17 +272,21 @@ vast-comfy --env-file .env session acquire --instance <ID>       # 取得獨占�
 vast-comfy --env-file .env session status  --instance <ID>       # 唯讀診斷
 vast-comfy --env-file .env session release --instance <ID> --session-id <SID>
 vast-comfy --env-file .env session recover --instance <ID> --accept-stale   # 明確的人工復原
+vast-comfy --env-file .env session resolve-inference --instance <ID> --intent-id <IID> --confirm-verified  # 查證後解除單筆推論 fence
 ```
 
 機制：
 
 - 真正的互斥由 instance 上的 **Linux `flock`** 提供，由一個背景 daemon 全程持有；`owner.json`（session、取得時間、最後心跳、控制端、daemon pid）只用於診斷。
 - **兩層排他**：`session` 鎖（跨控制端獨占）＋每次操作的**操作鎖**（同一 session 也不能同時跑兩個部署／下載／工作）。操作鎖由實際執行工作的程序或其背景 job 繼承持有，控制端斷線或 session daemon 結束都不會提前解除。
+- Python 共用同一個 `SSHRunner` 時，不同執行緒也立即衝突；操作 token 只屬於目前執行緒。真正的同執行緒巢狀呼叫共用同一個 lease，不能藉此讓其他工作並行。
 - 取得 session 前只會上傳**最小鎖元件**（`vc_common.py`／`vc_session.py` 的內容雜湊版本）；完整管理套件只在你持有所有權後才部署，衝突的另一方不會改到正在使用的程式碼。
 - **心跳自動更新**：每 30 秒；有效期 300 秒；額外緩衝 60 秒。時間以**instance 的時鐘**為準。
 - 衝突時立即失敗（exit code 4）並顯示持有者資訊；**不排隊、不搶鎖、不殺 Agent、不取消工作**。
 - 心跳過期只「回報」（時間、持有者、進行中工作、實際鎖狀態），**不會**自動接手。
 - 遠端工作存活期間，`flock` 實際持有，不代表過期就能插入；工作逾時只標記 `overdue` 並持續等待，**不會**代你終止。
+- ComfyUI 推論是另一個服務中的 HTTP 工作，不能靠管理程序 PID 判斷結束。smoke 逾時後背景 watcher 仍持鎖，停止後續案例，直到有可信終止證據；遲到成功也不算 `READY`。提交回應遺失不會重送。
+- 若 watcher 意外死亡或狀態無法確認，持久的待查證紀錄仍阻擋新工作、釋放與接手。這是安全拒絕，不表示 kernel flock 還有人持有；請以 `session status`／`jobs status` 的實際鎖與待查證資訊區分，交由人工查證，不刪鎖檔強行解鎖。確認 ComfyUI 佇列／history 已無該筆推論後，使用 `session resolve-inference --confirm-verified` 明確解除該筆 fence；這是唯一的人工解除路徑。
 - 釋放前若該 session 仍有存活工作或操作進行中 → 拒絕釋放（`E_LOCK_JOBS_RUNNING`／`E_LOCK_CONFLICT`）。
 
 **為什麼不能靠刪除鎖檔解鎖？**
@@ -311,6 +315,7 @@ vast-comfy --env-file .env jobs list    --instance <ID>
 
 - job 是獨立程序：本機關機、SSH 斷線都不會中止；重新登入後用 `jobs status` 追蹤。
 - **等待逾時不會停止 job**：`E_JOB_TIMEOUT` 會明確說明「job 可能仍在執行」。
+- smoke 案例逾時後，背景 watcher 會**持續持鎖**直到取得可信的推論結束證據；`jobs status` 會回報 `overdue`、`persistent_hold`、`pending_inferences`，用來區分 kernel 鎖與持久 fence。
 - 個別工具完成**不會**自動接續下一步；只有組合流程會照它定義的階段跑完。
 
 ### 不可恢復錯誤的處理原則
@@ -341,6 +346,7 @@ vast-comfy --env-file .env jobs list    --instance <ID>
 - 目標檔已存在且校驗相符 → 略過；**不符 → 失敗，絕不覆寫**。
 - 外掛固定在指定 commit；有本機修改或版本不符 → 失敗，**不做 reset／不自動更新**。
 - 目的路徑限定在 `models/` 允許子目錄與 `custom_nodes/<name>`，拒絕任何越界路徑。
+- 清單拒絕重複 YAML key、未知欄位、重複 ID／目的地及浮動的 `main`／`latest` revision；HF／插件必須使用完整 commit SHA。模型 ID 不能包含路徑。
 
 ```bash
 vast-comfy --env-file .env install run    --instance <ID> --session-id <SID>
@@ -375,6 +381,7 @@ vast-comfy --env-file .env smoke report --instance <ID> --session-id <SID> --run
 驗收細節：
 
 - 每次執行使用**該次專屬的 seed**（防 ComfyUI 節點快取讓舊結果冒充新結果），實際 seed 記錄在報告中。
+- 固定 seed 尚未有安全的快取失效實作；`--fixed-seed`／`smoke.unique_seed_per_run: false` 明確失敗，不會悄悄改成另一種 seed 模式。
 - 每張圖必須：本次執行後才產生（mtime）、尺寸正確、可解碼、不是單一顏色。
 - GPU 必須是 CUDA 裝置、`nvidia-smi` 正常；必要節點（含外掛節點）必須存在。
 - 全部通過才回傳 `READY`；只跑部分案例為 `PARTIAL`（永遠不算 READY）；任一失敗為 `FAILED` 且**後續案例不執行**，明確停止。
@@ -424,6 +431,7 @@ vast-comfy --env-file .env download outputs --instance <ID> --session-id <SID> -
 
 - 模型與外掛由 instance 直接下載，不經控制端轉傳。
 - **v1 不轉傳任何憑證到 instance**：若 `config/models.yaml` 的條目帶 `auth_env`（私密來源），流程會在付費或長時間安裝**之前**以 `E_APPROVAL_REQUIRED` 失敗並列出該些條目；請改用公開來源。
+- 來源只接受無憑證 HTTPS：拒絕 URL userinfo、query、fragment 及編碼繞路，不能把 token 塞進 URL 避開 `auth_env` 檢查。拒絕訊息不回顯原始敏感 URL；遠端安裝前還會重新驗證整批清單。
 - 未指定目的地前，本專案**不會**推送任何 repository、也不會擅自建立公開／私有 repo。
 
 ---
@@ -435,7 +443,7 @@ vast-comfy --env-file .env download outputs --instance <ID> --session-id <SID> -
 - `stop`：保留資料，**仍持續收硬碟費**；重新啟動不保證取回原 GPU。
 - `destroy`：**永久刪除 instance 內所有資料**（本工具 v1 不使用獨立 volume）。需要 `--confirm-destroy`，同意租用不等於同意刪資料。
 - `stop`／`destroy` 也是**修改操作**：必須指定仍持有獨占權的 session（`--session-id`），執行前會先取得遠端操作鎖並驗證所有權；API 未確認成功時回報 `E_UPSTREAM`，不假裝已停止或已銷毀。
-- 因為 instance 可能在命令被接受後立即失聯，`stop`／`destroy` 成功受理後**刻意保留**遠端鎖，等待平台轉換完成後由你或後續人工流程處理，不會先行解鎖。
+- 因為 API 逾時、5xx、畸形回應或中斷都可能發生在受理之後，`stop`／`destroy` 在送出請求**之前**即設定保留操作鎖；成功或出錯都不會自動解除。錯誤會揭露 action outcome、instance／session 與可能計費狀態，由你在管理頁面查證後接手，不能盲目重送。
 
 ```bash
 vast-comfy --env-file .env instance stop    --instance <ID> --session-id <SID>
@@ -510,7 +518,7 @@ vast-comfy --env-file .env instance destroy --instance <ID> --session-id <SID> -
 | 連線 | `vast-comfy ssh info` / `ssh test` / `ssh tunnel --start|--stop` |
 | 金鑰 | `vast-comfy keys generate` / `register` / `list` |
 | 部署 | `vast-comfy deploy package --instance <ID> --session-id <SID>`（僅在本專案管理元件；取得獨占權後才部署） |
-| 鎖 | `vast-comfy session acquire` / `status` / `release` / `recover --accept-stale` |
+| 鎖 | `vast-comfy session acquire` / `status` / `release` / `recover --accept-stale` / `resolve-inference --confirm-verified` |
 | 工作 | `vast-comfy jobs start` / `status` / `logs` / `wait` / `list` |
 | 安裝 | `vast-comfy install run` / `install verify` |
 | 服務 | `vast-comfy comfy status` / `health` / `restart` / `verify-nodes` / `gpu-check` / `logs` |

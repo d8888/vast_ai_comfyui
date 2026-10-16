@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -26,7 +27,9 @@ import vc_smoke as SMOKE  # noqa: E402
 def cmd_run(args) -> dict:
     C.ensure_dirs()
     C.ensure_owns(args.session_id)
-    run_dir = C.RUNS_DIR / args.run_id
+    if not os.environ.get("VAST_COMFY_OPERATION_FD"):
+        C.fail("E_LOCK_NOT_HELD", "Prepare requires an actual operation FD, not only a delegated token.", exit_code=4)
+    run_dir = C.reserve_run_directory(args.run_id, stage="prepare")
     summary: dict = {
         "ok": False,
         "run_id": args.run_id,
@@ -100,6 +103,7 @@ def cmd_run(args) -> dict:
             run_token=run_token,
             models=models,
             verify_model_shas=args.verify_model_shas,
+            _from_prepare=True,
         )
         summary["steps"]["smoke"] = smoke_result
         summary["ok"] = bool(smoke_result.get("ok"))

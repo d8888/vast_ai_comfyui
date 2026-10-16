@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from typing import Any
+from pathlib import PurePosixPath
 
 from . import jobs, remote
 from .config import Config
 from .errors import E_JOB_FAILED, E_SMOKE_FAILED, VastComfyError
-from .prepare import b64_json, build_models_payload, build_install_manifest, load_smoke_cases, new_run_id
+from .prepare import b64_json, build_models_payload, build_install_manifest, smoke_request
+from .safety import validate_identifier
 from .ssh import SSHRunner
 
 
@@ -26,9 +28,7 @@ def run_smoke(
     on_poll: Any = None,
 ) -> dict:
     """Run the smoke suite as a remote background job and return its summary."""
-    cases_doc = load_smoke_cases()
-    actual_run_id = run_id or new_run_id()
-    seed = int(base_seed if base_seed is not None else cfg.get("smoke.seed", 12345))
+    actual_run_id, seed, cases_doc = smoke_request(cfg, run_id=run_id, base_seed=base_seed, cases=cases)
     models_payload = build_models_payload(build_install_manifest()) if models else []
 
     argv = [
@@ -121,8 +121,12 @@ def show_report(
     runner: SSHRunner, cfg: Config, run_id: str, *, section: str = "all"
 ) -> dict:
     """Read the remote report (stays on the instance; no download happens here)."""
+    from .download import _resolve_remote
+    run_id = validate_identifier(run_id, label="run id")
     base = f"{remote.runtime_root(cfg)}/runs/{run_id}"
-    report = remote.read_remote_json(runner, cfg, f"{base}/report.json")
+    path = _resolve_remote(runner, remote.runtime_root(cfg), f"{base}/report.json",
+                           subdir=PurePosixPath("runs", run_id))
+    report = remote.read_remote_json(runner, cfg, path)
     payload = {"ok": True, "run_id": run_id, "report_path": f"{base}/report.json", "report": report}
     if section in ("all", "summary"):
         payload["verdict"] = report.get("verdict")

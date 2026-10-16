@@ -36,8 +36,10 @@ from .prepare import (
     new_run_id,
 )
 from .state import StateStore
+from .safety import validate_identifier
 from .vast.client import VastClient
-from .vast.rental import create_instance, image_ref, verify_creation, verify_offer, wait_for_running
+from .vast.rental import (create_instance, image_ref, verify_creation, verify_offer,
+                          wait_for_running, wait_created, created_resource)
 
 logger = get_logger("cli")
 
@@ -195,23 +197,23 @@ def cmd_rent_create(ctx: Ctx, args) -> dict:
     fresh = verify_offer(ctx.client, ctx.cfg, spec, args.offer_id)
     created = create_instance(ctx.client, ctx.cfg, fresh, args.label, paid_confirmed=args.confirm_paid)
     instance_id = created["instance_id"]
-    ctx.state.record_instance(
-        instance_id,
-        label=args.label,
-        alias=args.alias,
-        offer_id=args.offer_id,
-        image=image_ref(ctx.cfg),
-        dph_total=fresh.get("dph_total"),
-        created_at=time.time(),
-        state="created",
-    )
+    with created_resource(created):
+        ctx.state.record_instance(
+            instance_id,
+            label=args.label,
+            alias=args.alias,
+            offer_id=args.offer_id,
+            image=image_ref(ctx.cfg),
+            dph_total=fresh.get("dph_total"),
+            created_at=time.time(),
+            state="created",
+        )
     if not args.wait:
         created["note"] = "Instance created. Use `rent verify` and `instance wait-ready` next."
         return created
-    instance = wait_for_running(ctx.client, instance_id, ctx.cfg)
-    ctx.state.record_instance(instance_id, state="running")
-    runner = __import__("vast_comfy.instances", fromlist=["runner_for"]).runner_for(instance, ctx.cfg)
-    ssh = runner.check_login()
+    instance, _, ssh = wait_created(ctx.client, ctx.cfg, created)
+    with created_resource(created):
+        ctx.state.record_instance(instance_id, state="running")
     return {
         "instance_id": instance_id,
         "label": args.label,
@@ -315,9 +317,10 @@ def _portal_info(instance: dict, cfg: Config) -> dict:
 def cmd_instance_wait_ready(ctx: Ctx, args) -> dict:
     instance = wait_for_running(ctx.client, args.instance, ctx.cfg)
     from .instances import runner_for
+    from .ssh import wait_for_ssh
 
     runner = runner_for(instance, ctx.cfg)
-    ssh = runner.check_login()
+    ssh = wait_for_ssh(runner, ctx.cfg)
     return {
         "instance_id": instance.get("id"),
         "actual_status": instance.get("actual_status"),
@@ -499,6 +502,20 @@ def cmd_session_recover(ctx: Ctx, args) -> dict:
         payload["session_id"], instance_id=str(args.instance), state="active", recovered_at=time.time()
     )
     return payload
+
+
+def cmd_session_resolve_inference(ctx: Ctx, args) -> dict:
+    from .locks import resolve_inference
+    from .safety import validate_identifier
+
+    if not args.confirm_verified:
+        raise UsageError(
+            "Resolving an unresolved inference fence requires --confirm-verified: it declares that you "
+            "personally checked the ComfyUI queue/history and the correlated work is no longer running."
+        )
+    intent_id = validate_identifier(args.intent_id, label="intent id")
+    _, runner = ctx.instance_and_runner(args.instance)
+    return resolve_inference(runner, ctx.cfg, intent_id, confirm_verified=True)
 
 
 def cmd_jobs_start(ctx: Ctx, args) -> dict:
@@ -714,6 +731,7 @@ def cmd_smoke_run(ctx: Ctx, args) -> dict:
 def cmd_smoke_report(ctx: Ctx, args) -> dict:
     from . import locks, smoke
 
+    validate_identifier(args.run_id, label="run id")
     _, runner = ctx.instance_and_runner(args.instance)
     session_id = ctx.require_session(args.session_id, args.instance)
     with locks.operation(runner, ctx.cfg, session_id, label="report"):
@@ -724,6 +742,7 @@ def cmd_download_report(ctx: Ctx, args) -> dict:
     from . import download as dl
     from . import locks
 
+    validate_identifier(args.run_id, label="run id")
     _, runner = ctx.instance_and_runner(args.instance)
     session_id = ctx.require_session(args.session_id, args.instance)
     with locks.operation(runner, ctx.cfg, session_id, label="download"):
@@ -734,6 +753,7 @@ def cmd_download_images(ctx: Ctx, args) -> dict:
     from . import download as dl
     from . import locks
 
+    validate_identifier(args.run_id, label="run id")
     _, runner = ctx.instance_and_runner(args.instance)
     session_id = ctx.require_session(args.session_id, args.instance)
     with locks.operation(runner, ctx.cfg, session_id, label="download"):
@@ -763,7 +783,7 @@ def cmd_flow_prepare(ctx: Ctx, args) -> dict:
     from .prepare import prepare_existing
 
     _, runner = ctx.instance_and_runner(args.instance)
-    release = not args.keep_session
+    release = False if args.keep_session else None
     result = prepare_existing(
         runner,
         ctx.cfg,
@@ -807,7 +827,7 @@ def cmd_flow_create_and_prepare(ctx: Ctx, args) -> dict:
         label=args.label,
         confirm_paid=args.confirm_paid,
         accept_stale=args.accept_stale,
-        release_on_success=not args.keep_session,
+        release_on_success=False if args.keep_session else None,
         cases=args.cases,
         run_id=args.run_id,
         verify_model_shas=args.verify_model_shas,
@@ -979,6 +999,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--session-id", default=None)
     p.add_argument("--accept-stale", action="store_true")
     p.set_defaults(func=cmd_session_recover)
+    p = g.sub.add_parser(
+        "resolve-inference",
+        help="human rescue: clear one unresolved inference fence after verifying it ended (needs --confirm-verified)",
+        parents=[common],
+    )
+    p.add_argument("--instance", required=True)
+    p.add_argument("--intent-id", required=True)
+    p.add_argument("--confirm-verified", action="store_true")
+    p.set_defaults(func=cmd_session_resolve_inference)
 
     # jobs
     g = add_group("jobs", "remote background jobs")

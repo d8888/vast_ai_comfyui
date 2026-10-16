@@ -17,11 +17,15 @@ from __future__ import annotations
 
 import argparse
 import base64
+import errno
 import json
 import os
+import re
+import shutil
 import subprocess
 import sys
 import urllib.parse
+import uuid
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -53,9 +57,10 @@ def _curl_headers(entry: dict) -> list[str]:
 
 
 def _download(entry: dict, *, timeout_note: str = "") -> dict:
-    file_id = str(entry.get("id", "file"))
-    dest_rel = C.validate_model_relpath(str(entry["dest"]))
-    dest = C.COMFY_DIR / "models" / dest_rel
+    _validate_model_entry(entry)
+    file_id = C.validate_identifier(entry["id"], label="model id")
+    dest_rel = C.validate_model_relpath(entry["dest"])
+    dest = C.confined_path(C.confined_path(C.COMFY_DIR, "models"), dest_rel)
     expected_sha = str(entry["sha256"]).lower()
     expected_size = entry.get("size_bytes")
 
@@ -75,13 +80,18 @@ def _download(entry: dict, *, timeout_note: str = "") -> dict:
         )
 
     dest.parent.mkdir(parents=True, exist_ok=True)
-    C.DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = C.DOWNLOADS_DIR / f"{file_id}.part"
+    downloads = C.confined_path(C.RUNTIME_DIR, "downloads")
+    downloads.mkdir(parents=True, exist_ok=True)
+    tmp = C.confined_path(downloads, f"{file_id}.part")
+    if (downloads / f"{file_id}.part").is_symlink():
+        C.fail("E_INSTALL_PATH_ESCAPE", "A download partial must not be a symlink.")
 
     headers = _curl_headers(entry)
     argv = [
         "curl",
         "-fL",
+        "--proto", "=https",
+        "--proto-redir", "=https",
         "--retry",
         "3",
         "--retry-delay",
@@ -139,8 +149,34 @@ def _download(entry: dict, *, timeout_note: str = "") -> dict:
             id=file_id,
             path=str(dest),
         )
-    os.replace(tmp, dest)
+    _promote_without_overwrite(tmp, dest, expected_sha)
     return {"id": file_id, "action": "downloaded", "path": str(dest), "size_bytes": actual_size}
+
+
+def _promote_without_overwrite(tmp: Path, dest: Path, expected_sha: str) -> None:
+    """Atomic no-clobber publication, including separately mounted model dirs."""
+    staged = None
+    staged_owned = False
+    try:
+        try:
+            os.link(tmp, dest, follow_symlinks=False)
+        except OSError as exc:
+            if exc.errno != errno.EXDEV:
+                raise
+            staged = dest.with_name("." + dest.name + ".vast-comfy-" + uuid.uuid4().hex + ".part")
+            with staged.open("xb") as target:
+                staged_owned = True
+                with tmp.open("rb") as source:
+                    shutil.copyfileobj(source, target)
+            if C.sha256_file(staged) != expected_sha:
+                C.fail("E_INSTALL_HASH_MISMATCH", "Cross-filesystem staging failed checksum verification.")
+            os.link(staged, dest, follow_symlinks=False)
+    except FileExistsError as exc:
+        C.fail("E_INSTALL", "Destination appeared during publication; it was NOT overwritten.", path=str(dest))
+    finally:
+        if staged_owned:
+            staged.unlink(missing_ok=True)
+    tmp.unlink()
 
 
 def _git(args: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess:
@@ -151,9 +187,10 @@ def _git(args: list[str], cwd: Path | None = None) -> subprocess.CompletedProces
 
 
 def _install_plugin(entry: dict) -> dict:
-    plugin_id = str(entry.get("id", "plugin"))
-    rel = C.validate_plugin_relpath(str(entry["dest"]))
-    dest = C.COMFY_DIR / rel
+    _validate_plugin_entry(entry)
+    plugin_id = entry["id"]
+    rel = C.validate_plugin_relpath(entry["dest"])
+    dest = C.confined_path(C.COMFY_DIR, rel)
     commit = str(entry["commit"]).strip()
     repo = str(entry["repo_url"])
 
@@ -168,7 +205,7 @@ def _install_plugin(entry: dict) -> dict:
                 path=str(dest),
             )
         dirty = _git(["status", "--porcelain"], cwd=dest)
-        if dirty.stdout.strip():
+        if dirty.returncode != 0 or dirty.stdout.strip():
             C.fail(
                 "E_INSTALL_DIRTY",
                 f"{dest} has local modifications; refusing to reset or overwrite them.",
@@ -189,6 +226,10 @@ def _install_plugin(entry: dict) -> dict:
         return {"id": plugin_id, "action": "skipped", "path": str(dest), "commit": commit}
 
     dest.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        dest.mkdir()  # Exclusive claim: never git-init an existing user directory.
+    except FileExistsError:
+        C.fail("E_INSTALL", "Plugin destination appeared; nothing was overwritten.")
     steps = [
         ["init", "-q", str(dest)],
         ["-C", str(dest), "remote", "add", "origin", repo],
@@ -200,7 +241,7 @@ def _install_plugin(entry: dict) -> dict:
         if result.returncode != 0:
             C.fail(
                 "E_INSTALL",
-                f"git {' '.join(step[:2])} failed for {plugin_id}: {result.stderr.strip()[:300]}",
+                f"git {' '.join(step[:2])} failed for {plugin_id}: {C.redact(result.stderr.strip())[:300]}",
                 exit_code=1,
                 id=plugin_id,
                 path=str(dest),
@@ -217,7 +258,63 @@ def _install_plugin(entry: dict) -> dict:
     return {"id": plugin_id, "action": "installed", "path": str(dest), "commit": commit}
 
 
+def _validate_model_entry(entry: dict) -> None:
+    try:
+        if not isinstance(entry, dict) or set(entry) - {"id", "url", "dest", "sha256", "size_bytes", "auth_env"}:
+            raise ValueError("invalid model fields")
+        C.validate_identifier(entry["id"], label="model id")
+        rel = C.validate_model_relpath(entry["dest"])
+        C.confined_path(C.confined_path(C.COMFY_DIR, "models"), rel)
+        url = C.validate_public_url(entry["url"])
+        parsed = urllib.parse.urlsplit(url)
+        parts = parsed.path.strip("/").split("/")
+        pinned_hf = (parsed.hostname == "huggingface.co" and len(parts) >= 5 and parts[2] == "resolve"
+                     and re.fullmatch(r"[0-9a-f]{40}", parts[3]))
+        pinned_civitai = (parsed.hostname == "civitai.com"
+                          and re.fullmatch(r"/api/download/models/[1-9][0-9]*", parsed.path))
+        if not (pinned_hf or pinned_civitai) or not re.fullmatch(r"[0-9a-f]{64}", entry["sha256"]):
+            raise ValueError("unpinned source/hash")
+        size = entry.get("size_bytes")
+        if size is not None and (type(size) is not int or size <= 0):
+            raise ValueError("invalid size")
+    except (KeyError, TypeError, ValueError):
+        C.fail("E_CONFIG", "Invalid or unsafe model manifest entry; no download was started.")
+    if entry.get("auth_env"):
+        C.fail("E_APPROVAL_REQUIRED", "Remote credentials are not supported in v1; no download was started.")
+
+
+def _validate_plugin_entry(entry: dict) -> None:
+    try:
+        if not isinstance(entry, dict) or set(entry) - {"id", "repo_url", "commit", "dest", "required_nodes"}:
+            raise ValueError("invalid plugin fields")
+        C.validate_identifier(entry["id"], label="plugin id")
+        C.confined_path(C.COMFY_DIR, C.validate_plugin_relpath(entry["dest"]))
+        C.validate_public_url(entry["repo_url"])
+        if not re.fullmatch(r"[0-9a-f]{40}", entry["commit"]):
+            raise ValueError("unpinned plugin commit")
+        nodes = entry.get("required_nodes", [])
+        if not isinstance(nodes, list) or any(not isinstance(n, str) or not n for n in nodes):
+            raise ValueError("invalid required_nodes")
+    except (KeyError, TypeError, ValueError):
+        C.fail("E_CONFIG", "Invalid or unsafe plugin manifest entry; no checkout was started.")
+
+
+def _validate_manifest(manifest: dict) -> None:
+    if (not isinstance(manifest, dict) or set(manifest) != {"models", "plugins"}
+            or not isinstance(manifest["models"], list) or not isinstance(manifest["plugins"], list)):
+        C.fail("E_CONFIG", "Invalid install manifest schema.")
+    ids, destinations = set(), set()
+    for kind, validator in (("models", _validate_model_entry), ("plugins", _validate_plugin_entry)):
+        for entry in manifest[kind]:
+            validator(entry)
+            dest = ("models/" if kind == "models" else "") + entry["dest"]
+            if entry["id"] in ids or dest in destinations:
+                C.fail("E_CONFIG", "Duplicate install identifier or destination.")
+            ids.add(entry["id"]); destinations.add(dest)
+
+
 def _install_manifest(manifest: dict) -> dict:
+    _validate_manifest(manifest)  # Validate the entire batch before its first mutation.
     models = []
     plugins = []
     for entry in manifest.get("models", []):

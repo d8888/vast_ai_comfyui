@@ -122,7 +122,14 @@ class VastClient:
                     code=E_NETWORK,
                     message=f"Network error calling Vast.ai API {method} {path}: {exc.__class__.__name__}",
                     details={"endpoint": path, "method": method},
-                    hints=["Check connectivity and retry. Nothing was changed by this failed call."],
+                    hints=(["Check connectivity and retry the read-only query."] if allow_retry else
+                           ["The request may have been accepted. Verify its outcome before retrying."]),
+                ) from exc
+            except requests.RequestException as exc:
+                raise VastComfyError(
+                    code=E_NETWORK, message=f"Transport failed during Vast.ai API {method} {path}",
+                    details={"endpoint": path, "method": method, "error_type": type(exc).__name__},
+                    hints=["The outcome may be unknown; verify before retrying any mutation."],
                 ) from exc
 
             if resp.status_code == 429 or 500 <= resp.status_code < 600:
@@ -260,7 +267,8 @@ class VastClient:
             raise VastComfyError(
                 code=E_UPSTREAM,
                 message=f"Vast.ai did not confirm {action}; the actual resource state must be checked.",
-                details={"instance_id": instance_id, "action": action, "api_message": scrub(str(payload))[:300]},
+                details={"instance_id": instance_id, "action": action, "api_message": scrub(str(payload))[:300],
+                         "action_outcome": "rejected" if isinstance(payload, dict) and payload.get("success") is False else "unknown"},
             )
         return payload
 

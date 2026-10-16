@@ -386,9 +386,9 @@ def _validate_semantics(data: dict[str, Any]) -> None:
     _require_number(data["comfy"]["restart_wait_seconds"], "comfy.restart_wait_seconds", minimum=10)
 
     smoke = data["smoke"]
-    _require_number(smoke["seed"], "smoke.seed", minimum=0, integral=True)
-    if smoke["unique_seed_per_run"] not in (True, False):
-        raise ConfigError("smoke.unique_seed_per_run must be a boolean")
+    _require_number(smoke["seed"], "smoke.seed", minimum=0, maximum=2**64 - 1, integral=True)
+    if smoke["unique_seed_per_run"] is not True:
+        raise ConfigError("smoke.unique_seed_per_run must be true; fixed-seed smoke is unsupported in v1")
 
     if data["session"]["release_on_success"] not in (True, False):
         raise ConfigError("session.release_on_success must be a boolean")

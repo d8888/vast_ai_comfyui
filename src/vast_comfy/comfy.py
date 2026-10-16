@@ -16,7 +16,8 @@ def status(runner: SSHRunner, cfg: Config, session_id: str) -> dict:
         runner,
         cfg,
         "vc_comfy.py",
-        ["status", "--session-id", session_id, "--comfy-url", _comfy_url(cfg)],
+        ["status", "--session-id", session_id, "--comfy-url", _comfy_url(cfg),
+         "--service", str(cfg.require("image.supervisor_service"))],
         timeout_seconds=120,
     )
 
@@ -41,6 +42,7 @@ def restart(runner: SSHRunner, cfg: Config, session_id: str) -> dict:
             _comfy_url(cfg),
             "--wait-seconds",
             str(cfg.get("comfy.restart_wait_seconds", 240)),
+            "--service", str(cfg.require("image.supervisor_service")),
         ],
         timeout_seconds=int(cfg.get("comfy.restart_wait_seconds", 240)) + 120,
     )
@@ -86,6 +88,7 @@ def logs(runner: SSHRunner, cfg: Config, session_id: str, *, tail: int = 200) ->
         runner,
         cfg,
         "vc_comfy.py",
-        ["logs", "--session-id", session_id, "--tail", str(int(tail))],
+        ["logs", "--session-id", session_id, "--tail", str(int(tail)),
+         "--service", str(cfg.require("image.supervisor_service"))],
         timeout_seconds=120,
     )

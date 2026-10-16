@@ -7,13 +7,39 @@ import getpass
 import json
 import socket
 import sys
+import threading
 import time
 import uuid
 
 from .config import Config
-from .errors import E_LOCK_NOT_HELD, VastComfyError
+from .errors import E_LOCK_NOT_HELD, E_USAGE, VastComfyError
 from .remote import ensure_bootstrap, invoke
 from .ssh import SSHRunner
+
+_LOCAL = threading.local()
+_GUARD_INIT = threading.Lock()
+_LOCK_TYPE = type(threading.Lock())
+
+
+def _contexts() -> dict:
+    if not hasattr(_LOCAL, "operations"):
+        _LOCAL.operations = {}
+    return _LOCAL.operations
+
+
+def operation_token(runner) -> str | None:
+    """Delegation belongs to this thread's context, never a shared runner field."""
+    context = _contexts().get(id(runner))
+    return context[2].token if context and context[0] is runner else None
+
+
+def _runner_guard(runner):
+    with _GUARD_INIT:
+        guard = getattr(runner, "_vast_local_operation_guard", None)
+        if not isinstance(guard, _LOCK_TYPE):
+            guard = threading.Lock()
+            runner._vast_local_operation_guard = guard
+        return guard
 
 
 def new_session_id() -> str:
@@ -118,6 +144,33 @@ def assert_owns(runner: SSHRunner, cfg: Config, session_id: str) -> dict:
     return payload
 
 
+def resolve_inference(runner: SSHRunner, cfg: Config, intent_id: str, *, confirm_verified: bool) -> dict:
+    """Human rescue for one persistent inference fence; never touches instance locks.
+
+    The operator must have personally verified (ComfyUI UI/API) that the
+    correlated prompt is no longer running; ``confirm_verified`` carries that
+    explicit statement. No session ownership is required because this is the
+    documented way out of a dead-watcher fence.
+    """
+    from .safety import validate_identifier
+
+    intent_id = validate_identifier(intent_id, label="intent id")
+    if not confirm_verified:
+        raise VastComfyError(
+            code=E_USAGE,
+            message="resolve_inference requires confirm_verified=True (explicit human verification).",
+            stage="session",
+        )
+    ensure_bootstrap(runner, cfg)
+    return invoke(
+        runner,
+        cfg,
+        "vc_session.py",
+        ["resolve-inference", "--intent-id", intent_id, "--confirm-verified"],
+        timeout_seconds=60,
+    )
+
+
 class OperationHandle:
     def __init__(self, token):
         self.token, self.retained = token, False
@@ -130,31 +183,41 @@ class OperationHandle:
 @contextlib.contextmanager
 def operation(runner: SSHRunner, cfg: Config, session_id: str, *, label: str = "operation"):
     """Hold remote exclusion across multiple SSH/SCP or platform API calls."""
-    existing = getattr(runner, "_vast_operation_token", None)
-    if isinstance(existing, str):
+    contexts = _contexts()
+    existing = contexts.get(id(runner))
+    if existing and existing[0] is runner:
+        if existing[1] != session_id:
+            raise VastComfyError(E_LOCK_NOT_HELD, "Nested operation belongs to a different session.", stage="session")
         assert_owns(runner, cfg, session_id)
-        yield OperationHandle(existing)
+        yield existing[2]  # Shared handle: inner retain() must propagate outward.
         return
-    ensure_bootstrap(runner, cfg)
-    token = uuid.uuid4().hex
-    invoke(runner, cfg, "vc_session.py", ["begin-operation", "--session-id", session_id,
-           "--operation-token", token, "--label", label], timeout_seconds=60)
-    runner._vast_operation_token = token
-    handle = OperationHandle(token)
-    error = None
+    guard = _runner_guard(runner)
+    if not guard.acquire(blocking=False):
+        raise VastComfyError("E_LOCK_CONFLICT", "Another thread is operating through this SSH runner.",
+                             stage="session", details={"session_id": session_id})
     try:
-        yield handle
-    except BaseException as exc:
-        error = exc
-        raise
+        ensure_bootstrap(runner, cfg)
+        token = uuid.uuid4().hex
+        invoke(runner, cfg, "vc_session.py", ["begin-operation", "--session-id", session_id,
+               "--operation-token", token, "--label", label], timeout_seconds=60)
+        handle = OperationHandle(token)
+        contexts[id(runner)] = (runner, session_id, handle)
+        error = None
+        try:
+            yield handle
+        except BaseException as exc:
+            error = exc
+            raise
+        finally:
+            contexts.pop(id(runner), None)
+            if not handle.retained:
+                try:
+                    invoke(runner, cfg, "vc_session.py", ["end-operation", "--session-id", session_id,
+                           "--operation-token", token], timeout_seconds=60)
+                except VastComfyError as exc:
+                    if error is None:
+                        raise
+                    if isinstance(error, VastComfyError):
+                        error.details["operation_release_error"] = exc.to_dict()
     finally:
-        runner._vast_operation_token = None
-        if not handle.retained:
-            try:
-                invoke(runner, cfg, "vc_session.py", ["end-operation", "--session-id", session_id,
-                       "--operation-token", token], timeout_seconds=60)
-            except VastComfyError as exc:
-                if error is None:
-                    raise
-                if isinstance(error, VastComfyError):
-                    error.details["operation_release_error"] = exc.to_dict()
+        guard.release()

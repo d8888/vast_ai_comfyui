@@ -200,7 +200,9 @@ def rental_preflight(client, cfg: Config) -> dict:
                 agent_identities = {i for line in result.stdout.splitlines() if (i := _public_identity(line))}
         except (OSError, subprocess.TimeoutExpired):
             pass
-    identities: set[str] = set()
+    # With no explicit identity selection, OpenSSH can authenticate entirely
+    # through ssh-agent (including hardware-backed keys with no local private file).
+    identities: set[str] = set(agent_identities) if configured is None else set()
     candidates = [configured] if configured else [Path.home() / ".ssh" / n for n in ("id_ed25519", "id_rsa")]
     for private in candidates:
         if not private.is_file():

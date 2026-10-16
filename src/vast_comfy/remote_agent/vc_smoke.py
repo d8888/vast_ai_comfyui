@@ -22,6 +22,7 @@ import base64
 import hashlib
 import json
 import math
+import os
 import secrets
 import shutil
 import sys
@@ -339,12 +340,12 @@ def validate_graph(case: dict, prompt: dict, seed: int, assets_dir: Path) -> dic
     }
 
 
-def submit_prompt(base_url: str, prompt: dict) -> str:
+def submit_prompt(base_url: str, prompt: dict, *, client_id: str = SMOKE_CLIENT_ID) -> str:
     try:
         response = CM.http_json(
             f"{base_url}/prompt",
             method="POST",
-            body={"prompt": prompt, "client_id": SMOKE_CLIENT_ID},
+            body={"prompt": prompt, "client_id": client_id},
             timeout=60.0,
         )
     except urllib.error.HTTPError as exc:
@@ -361,11 +362,17 @@ def submit_prompt(base_url: str, prompt: dict) -> str:
         raise CaseFailure(
             "SMOKE_SUBMIT",
             f"ComfyUI rejected the prompt (HTTP {exc.code})",
-            {"error": (parsed or {}).get("error"), "node_errors": (parsed or {}).get("node_errors")},
+            {"error": parsed.get("error") if isinstance(parsed, dict) else None,
+             "node_errors": parsed.get("node_errors") if isinstance(parsed, dict) else None,
+             "submission_rejected": exc.code == 400 and isinstance(parsed, dict)
+                                    and bool(parsed.get("error") or parsed.get("node_errors"))},
         ) from exc
-    if not isinstance(response, dict) or not response.get("prompt_id"):
+    if not isinstance(response, dict) or not isinstance(response.get("prompt_id"), str):
         raise CaseFailure("SMOKE_SUBMIT", "ComfyUI did not return a prompt_id", {"response": response})
-    return str(response["prompt_id"])
+    try:
+        return C.validate_identifier(response["prompt_id"], "prompt id")
+    except ValueError as exc:
+        raise CaseFailure("SMOKE_SUBMIT", "ComfyUI returned an unsafe prompt_id") from exc
 
 
 def wait_for_history(base_url: str, prompt_id: str, timeout_seconds: float) -> dict:
@@ -373,8 +380,11 @@ def wait_for_history(base_url: str, prompt_id: str, timeout_seconds: float) -> d
         raise CaseFailure("SMOKE_CONFIG", "history timeout must be finite and positive")
     deadline = time.monotonic() + timeout_seconds
     last_status = {}
-    while time.monotonic() < deadline:
-        history = CM.http_json(f"{base_url}/history/{prompt_id}", timeout=20.0) or {}
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        history = CM.http_json(f"{base_url}/history/{prompt_id}", timeout=min(20.0, remaining)) or {}
         if not isinstance(history, dict):
             raise CaseFailure("SMOKE_HISTORY", "history must be a mapping")
         entry = history.get(prompt_id)
@@ -401,10 +411,10 @@ def wait_for_history(base_url: str, prompt_id: str, timeout_seconds: float) -> d
                 if status.get("status_str") == "success":
                     return entry
                 raise CaseFailure(
-                    "SMOKE_EXEC_ERROR", "ComfyUI completed with a non-success status",
+                    "SMOKE_HISTORY", "ComfyUI returned an unknown completion status",
                     {"status": status, "messages": messages},
                 )
-        time.sleep(2.0)
+        time.sleep(min(2.0, max(0.0, deadline - time.monotonic())))
     raise CaseFailure(
         "SMOKE_TIMEOUT",
         f"case did not finish within {timeout_seconds:.0f}s",
@@ -414,6 +424,93 @@ def wait_for_history(base_url: str, prompt_id: str, timeout_seconds: float) -> d
             "note": "ComfyUI may still be executing; nothing was cancelled.",
         },
     )
+
+
+def _inference_progress(record: dict, *, state: str, reason: str | None = None, **details) -> None:
+    record.update(state=state, updated_at=C.now_epoch(), **details)
+    if reason:
+        record["reason"] = reason
+    C.write_inference(record)  # Commit the safety fence before reporting progress.
+    C.write_job_progress({
+        "deadline_at": record["deadline_at"],
+        "state": "overdue" if record.get("overdue") else "running",
+        "reason": record.get("reason"), "intent_id": record["intent_id"],
+        "prompt_id": record.get("prompt_id"), "run_id": record["run_id"],
+        "case_id": record["case_id"], "persistent_hold": state not in ("terminal", "rejected"),
+        "work_state": state, "last_error": record.get("last_error"),
+    })
+
+
+def submit_and_watch(base_url: str, prompt: dict, timeout_seconds: float, *,
+                     session_id: str, run_id: str, case_id: str) -> tuple[str, dict]:
+    """The background smoke process is the long-lived, FD-holding watcher.
+
+    Observer timeouts/errors are NOT completion. Unknown POST outcomes are never
+    retried, even when no prompt ID was returned. The durable fence survives any
+    process failure; the job runner also waits for unresolved work before exit.
+    """
+    C.assert_no_pending_inferences()
+    if not _positive_number(timeout_seconds):
+        raise CaseFailure("SMOKE_CONFIG", "inference timeout must be finite and positive")
+    deadline = time.monotonic() + timeout_seconds
+    intent_id = secrets.token_hex(16)
+    record = {
+        "intent_id": intent_id, "session_id": session_id, "run_id": run_id, "case_id": case_id,
+        "operation_token": os.environ.get("VAST_COMFY_OPERATION_TOKEN"),
+        "job_id": os.environ.get("VAST_COMFY_JOB_ID"), "watcher_pid": os.getpid(),
+        "created_at": C.now_epoch(), "client_id": f"{SMOKE_CLIENT_ID}-{intent_id}",
+    }
+    record["deadline_at"] = C.now_epoch() + timeout_seconds
+    _inference_progress(record, state="submitting")
+    try:
+        prompt_id = submit_prompt(base_url, prompt, client_id=record["client_id"])
+    except Exception as exc:
+        if isinstance(exc, CaseFailure) and exc.details.get("submission_rejected") is True:
+            _inference_progress(record, state="rejected", rejection_confirmed=True, ended_at=C.now_epoch())
+            raise
+        _inference_progress(record, state="submission_unknown", reason="SMOKE_SUBMIT_UNCERTAIN",
+                            overdue=True, last_error=C.redact(str(exc)))
+        # No ID means no trustworthy correlation. Do not re-POST, infer completion
+        # from an empty queue, or expire this hold. Explicit operator review is
+        # required; the controller immediately observes overdue, not an endless wait.
+        while True:
+            time.sleep(2.0)
+
+    _inference_progress(record, state="running", prompt_id=prompt_id)
+    sticky: CaseFailure | None = None
+    observer_timeout = max(0.001, deadline - time.monotonic())
+    while True:
+        try:
+            entry = wait_for_history(base_url, prompt_id, observer_timeout)
+        except CaseFailure as exc:
+            if exc.reason == "SMOKE_EXEC_ERROR":
+                _inference_progress(record, state="terminal", ended_at=C.now_epoch(),
+                                    terminal_status=exc.details.get("status"))
+                if sticky:
+                    sticky.details.update(exc.details)
+                    sticky.details["inference_terminated"] = True
+                    raise sticky
+                raise
+            sticky = sticky or exc
+        except Exception as exc:
+            sticky = sticky or CaseFailure("SMOKE_HISTORY_UNCERTAIN", "Cannot establish HTTP inference completion",
+                                           {"prompt_id": prompt_id, "last_error": C.redact(str(exc))})
+        else:
+            if sticky is None and time.monotonic() >= deadline:
+                sticky = CaseFailure("SMOKE_TIMEOUT", f"case did not finish within {timeout_seconds:.0f}s",
+                                     {"prompt_id": prompt_id})
+                record.update(overdue=True, reason=sticky.reason)
+            _inference_progress(record, state="terminal", ended_at=C.now_epoch(),
+                                terminal_status=entry.get("status"))
+            if sticky:
+                sticky.details.update(inference_terminated=True, status=entry.get("status") or {},
+                                      messages=(entry.get("status") or {}).get("messages") or [])
+                raise sticky  # A late success must never turn a timeout into READY.
+            return prompt_id, entry
+        _inference_progress(record, state="completion_unknown", reason=sticky.reason,
+                            overdue=True, last_error=C.redact(sticky.message))
+        observer_timeout = 30.0
+        time.sleep(2.0)
 
 
 def reject_cached_samplers(entry: dict, prompt: dict) -> None:
@@ -706,9 +803,11 @@ def run_suite(
     models: list[dict] | None = None,
     verify_model_shas: bool = False,
     require_plugin_node: bool = True,
+    _from_prepare: bool = False,
 ) -> tuple[dict, int]:
     started_at = C.now_epoch()
-    run_dir = C.RUNS_DIR / run_id
+    C.assert_no_pending_inferences()
+    run_dir = C.reserve_run_directory(run_id, stage="smoke", from_prepare=_from_prepare)
 
     def early(result: dict, exit_code: int) -> tuple[dict, int]:
         C.atomic_write_json(run_dir / "summary.json", result)
@@ -830,10 +929,11 @@ def run_suite(
                     "E_COMFY_BUSY", "ComfyUI became busy; refusing to insert the next smoke case",
                     {"queue": queue},
                 )
-            prompt_id = submit_prompt(base_url, prompt)
-            record["prompt_id"] = prompt_id
             timeout_seconds = float(case["timeout_minutes"]) * 60.0
-            entry = wait_for_history(base_url, prompt_id, timeout_seconds)
+            prompt_id, entry = submit_and_watch(
+                base_url, prompt, timeout_seconds, session_id=session_id, run_id=run_id, case_id=case["id"],
+            )
+            record["prompt_id"] = prompt_id
             record["history_status"] = entry.get("status") or {}
             record["execution_messages"] = record["history_status"].get("messages") or []
             reject_cached_samplers(entry, prompt)
@@ -850,6 +950,8 @@ def run_suite(
             )
         except CaseFailure as exc:
             overall_ok = False
+            if exc.details.get("prompt_id"):
+                record["prompt_id"] = exc.details["prompt_id"]
             if "messages" in exc.details:
                 record["execution_messages"] = exc.details["messages"]
             if "status" in exc.details:
@@ -868,7 +970,7 @@ def run_suite(
                 {
                     "status": "failed",
                     "reason": "SMOKE_UNEXPECTED",
-                    "error": {"message": str(exc), "details": {}},
+                    "error": {"message": C.redact(str(exc)), "details": {}},
                     "duration_seconds": round(C.now_epoch() - case_start, 1),
                 }
             )
@@ -926,6 +1028,9 @@ def run_suite(
 def cmd_run(args) -> None:
     C.ensure_dirs()
     C.ensure_owns(args.session_id)
+    if not os.environ.get("VAST_COMFY_OPERATION_FD"):
+        C.fail("E_LOCK_NOT_HELD", "Smoke inference requires an actual inherited operation FD, not only a token.",
+               exit_code=4)
     cases = load_cases(args.cases_b64)
     if args.cases:
         wanted = {c.strip() for c in args.cases.split(",") if c.strip()}
@@ -988,7 +1093,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv=None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
-    C.run_cli(args.func, args)
+    C.run_cli(args.func, args, guard=True)
 
 
 if __name__ == "__main__":

@@ -23,10 +23,11 @@ from .create_flow import quote_for_alias
 from .errors import VastComfyError
 from .gpu import AliasSpec, load_mapping
 from .instances import live_instance, load_runner, runner_for
-from .ssh import SSHRunner
+from .ssh import SSHRunner, wait_for_ssh
+from .safety import validate_identifier
 from .state import StateStore
 from .vast.client import VastClient
-from .vast.rental import create_instance, verify_creation, verify_offer, wait_for_running
+from .vast.rental import create_instance, verify_creation, verify_offer, wait_for_running, wait_created
 
 __all__ = [
     "Config",
@@ -44,6 +45,7 @@ __all__ = [
     "session_status",
     "session_release",
     "session_recover",
+    "session_resolve_inference",
     "comfy_status",
     "comfy_health",
     "comfy_restart",
@@ -95,9 +97,7 @@ def rent_create(
     created = create_instance(client, cfg, fresh, label, paid_confirmed=confirm_paid)
     if not wait:
         return created
-    instance = wait_for_running(client, created["instance_id"], cfg)
-    runner = runner_for(instance, cfg)
-    ssh = runner.check_login()
+    _, _, ssh = wait_created(client, cfg, created)
     return {**created, "ssh": ssh}
 
 
@@ -180,6 +180,7 @@ def smoke_run(
 
 
 def show_report(cfg: Config, instance_id: int | str, run_id: str, *, session_id: str, client: VastClient | None = None) -> dict:
+    validate_identifier(run_id, label="run id")
     _, runner = _runner(cfg, instance_id, client)
     with _locks.operation(runner, cfg, session_id, label="report"):
         return _smoke.show_report(runner, cfg, run_id)
@@ -203,6 +204,12 @@ def session_release(cfg: Config, instance_id: int | str, session_id: str, *, cli
 def session_recover(cfg: Config, instance_id: int | str, *, session_id: str | None = None, client: VastClient | None = None) -> dict:
     _, runner = _runner(cfg, instance_id, client)
     return _locks.recover(runner, cfg, instance_id, session_id=session_id)
+
+
+def session_resolve_inference(cfg: Config, instance_id: int | str, intent_id: str, *,
+                              confirm_verified: bool, client: VastClient | None = None) -> dict:
+    _, runner = _runner(cfg, instance_id, client)
+    return _locks.resolve_inference(runner, cfg, intent_id, confirm_verified=confirm_verified)
 
 
 def comfy_status(cfg: Config, instance_id: int | str, session_id: str, *, client: VastClient | None = None) -> dict:
@@ -229,7 +236,7 @@ def wait_instance_ready(cfg: Config, instance_id: int | str, *, client: VastClie
     client = client or make_client(cfg)
     instance = wait_for_running(client, instance_id, cfg)
     runner = runner_for(instance, cfg)
-    return {**runner.check_login(), "instance_id": instance.get("id")}
+    return {**wait_for_ssh(runner, cfg), "instance_id": instance.get("id")}
 
 
 # ---------------------------------------------------------------------------
@@ -238,12 +245,14 @@ def wait_instance_ready(cfg: Config, instance_id: int | str, *, client: VastClie
 
 
 def download_report(cfg: Config, instance_id: int | str, run_id: str, dest: Path | str, *, session_id: str, overwrite: bool = False, client: VastClient | None = None) -> dict:
+    validate_identifier(run_id, label="run id")
     _, runner = _runner(cfg, instance_id, client)
     with _locks.operation(runner, cfg, session_id, label="download"):
         return _download.download_report(runner, cfg, run_id=run_id, dest_dir=dest, overwrite=overwrite)
 
 
 def download_smoke_images(cfg: Config, instance_id: int | str, run_id: str, dest: Path | str, *, session_id: str, overwrite: bool = False, client: VastClient | None = None) -> dict:
+    validate_identifier(run_id, label="run id")
     _, runner = _runner(cfg, instance_id, client)
     with _locks.operation(runner, cfg, session_id, label="download"):
         return _download.download_smoke_images(runner, cfg, run_id=run_id, dest_dir=dest, overwrite=overwrite)

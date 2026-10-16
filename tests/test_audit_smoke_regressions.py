@@ -351,9 +351,9 @@ def test_timeout_preserves_last_execution_messages(audit):
     audit.monkeypatch.setattr(audit.agent.CM, "http_json", lambda *a, **k: {
         "pending": {"status": {"completed": False, "status_str": "running", "messages": messages}},
     })
-    clock = iter([0.0, 0.0, 2.0])
-    audit.monkeypatch.setattr(audit.agent.SMOKE.time, "monotonic", lambda: next(clock))
-    audit.monkeypatch.setattr(audit.agent.SMOKE.time, "sleep", lambda _: None)
+    clock = {"now": 0.0}
+    audit.monkeypatch.setattr(audit.agent.SMOKE.time, "monotonic", lambda: clock["now"])
+    audit.monkeypatch.setattr(audit.agent.SMOKE.time, "sleep", lambda seconds: clock.update(now=clock["now"] + seconds))
     with pytest.raises(audit.agent.SMOKE.CaseFailure) as error:
         audit.agent.SMOKE.wait_for_history("http://mock.invalid", "pending", 1.0)
     assert error.value.reason == "SMOKE_TIMEOUT" and error.value.details["messages"] == messages

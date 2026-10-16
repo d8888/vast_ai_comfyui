@@ -68,6 +68,7 @@ def _archive_owner(owner) -> None:
 
 def cmd_acquire(args) -> None:
     C.ensure_dirs()
+    C.assert_no_pending_inferences()
     session_id = args.session_id
     held = _probe()
     owner = _owner()
@@ -211,7 +212,8 @@ def cmd_daemon(args) -> None:
         os.close(fd)
         sys.exit(4)
 
-    if C.operation_held() or (owner and C.session_jobs(str(owner.get("session_id")), alive_only=True)):
+    if (C.pending_inferences() or C.operation_held()
+            or (owner and C.session_jobs(str(owner.get("session_id")), alive_only=True))):
         fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
         sys.exit(4)
@@ -244,12 +246,13 @@ def cmd_daemon(args) -> None:
                     blocked_file = C.LOCK_DIR / "release.blocked"
                     blocked_file.unlink(missing_ok=True)
                     alive = C.session_jobs(args.session_id, alive_only=True)
-                    if alive:
+                    pending = C.pending_inferences()
+                    if alive or pending:
                         # Refuse to release: work is still running and must not be
                         # left behind unsynchronized. Report and keep holding.
                         C.atomic_write_json(
                             blocked_file,
-                            {"at": C.now_epoch(), "jobs": alive},
+                            {"at": C.now_epoch(), "jobs": alive, "pending_inferences": pending},
                         )
                         continue
                     record = _owner() or record
@@ -281,11 +284,16 @@ def cmd_status(args) -> None:
     report = _stale_report(owner)
     daemon_alive = bool(owner and C.pid_alive(owner.get("daemon_pid")))
     held = _probe()
+    pending = C.pending_inferences()
+    operation_held = C.operation_held()
     payload = {
         "ok": True,
         "lock_held": held,
         "daemon_alive": daemon_alive,
-        "operation_held": C.operation_held(),
+        "operation_held": operation_held,
+        "operation_kernel_held": operation_held,
+        "persistent_hold": bool(pending),
+        "pending_inferences": pending,
         "operation": C.read_json(C.OPERATION_OWNER, {}),
         "matches_me": bool(
             args.session_id
@@ -306,6 +314,7 @@ def cmd_status(args) -> None:
 
 def cmd_release(args) -> None:
     C.ensure_dirs()
+    C.assert_no_pending_inferences()
     owner = _owner()
     if not owner or owner.get("session_id") != args.session_id or owner.get("state") != "active":
         C.fail(
@@ -363,6 +372,7 @@ def cmd_list_jobs(args) -> None:
 
 
 def cmd_begin_operation(args) -> None:
+    C.assert_no_pending_inferences()
     C.ensure_owns(args.session_id)
     if C.operation_held():
         C.fail("E_LOCK_CONFLICT", "Another operation is already active.", exit_code=4,
@@ -387,12 +397,16 @@ def cmd_begin_operation(args) -> None:
 def cmd_operation_daemon(args) -> None:
     with C.operation(args.session_id, label=args.label, token=args.operation_token):
         request = C.LOCK_DIR / ("operation-release-" + args.operation_token)
-        while not request.exists():
+        while True:
+            if request.exists():
+                request.unlink()
+                if not C.pending_inferences():
+                    break
             time.sleep(0.1)
-        request.unlink()
 
 
 def cmd_end_operation(args) -> None:
+    C.assert_no_pending_inferences()
     record = C.read_json(C.OPERATION_OWNER, {}) or {}
     if record.get("session_id") != args.session_id or record.get("token") != args.operation_token:
         C.fail("E_LOCK_NOT_HELD", "Operation ownership changed; nothing was released.", exit_code=4)
@@ -404,6 +418,41 @@ def cmd_end_operation(args) -> None:
             C.emit({"ok": True, "operation_released": True})
         time.sleep(0.05)
     C.fail("E_LOCK_NOT_HELD", "Operation release outcome uncertain; inspect session status.", exit_code=4)
+
+
+def cmd_resolve_inference(args) -> None:
+    """Human rescue: mark ONE unresolved HTTP-inference fence as verified-ended.
+
+    This never touches kernel locks or the instance. It must only be used after
+    the operator personally verified (ComfyUI UI/API queue+history) that the
+    correlated prompt is no longer running; the explicit flag is required.
+    """
+    C.ensure_dirs()
+    try:
+        intent_id = C.validate_identifier(args.intent_id, "intent id")
+    except ValueError:
+        C.fail("E_USAGE", "Invalid intent id.")
+    record = C.read_json(C.confined_path(C.INFERENCE_DIR, intent_id + ".json"), default=None)
+    if not isinstance(record, dict):
+        C.fail("E_USAGE", f"No such inference intent: {intent_id}")
+    if record.get("state") in ("terminal", "rejected"):
+        C.emit({"ok": True, "intent_id": intent_id, "already_resolved": True})
+        return
+    if not args.confirm_verified:
+        C.fail(
+            "E_APPROVAL_REQUIRED",
+            "Resolving an unresolved inference requires --confirm-verified: it declares that you "
+            "personally checked the ComfyUI queue/history and no work from this intent is still running.",
+            exit_code=21,
+            intent_id=intent_id,
+        )
+    record.update(state="rejected", rejection_confirmed=True, resolved_by="operator",
+                  resolved_at=C.now_epoch(), note=str(args.note or ""))
+    C.write_inference(record)
+    C.emit({
+        "ok": True, "intent_id": intent_id, "resolved": True,
+        "warning": "No automatic check was possible; this records the operator's confirmation that the work ended.",
+    })
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -453,6 +502,12 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--operation-token", required=True)
         p.add_argument("--label", default="operation")
         p.set_defaults(func=func)
+
+    p = sub.add_parser("resolve-inference")
+    p.add_argument("--intent-id", required=True)
+    p.add_argument("--confirm-verified", action="store_true")
+    p.add_argument("--note", default="")
+    p.set_defaults(func=cmd_resolve_inference)
 
     return parser
 

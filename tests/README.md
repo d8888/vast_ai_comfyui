@@ -38,6 +38,25 @@ run instead of being skipped.
 | `test_cli.py` | 19 — one-JSON-object stdout, exit codes, stable codes |
 | `test_linux_session.py` | 9-11, 15, 18 — real `flock` daemon semantics (Linux only) |
 
+### Audit regression suites
+
+Each audit finding has a dedicated offline regression file (all use mocks;
+none touch the network, a real GPU or a real instance):
+
+| File | Scope |
+| --- | --- |
+| `test_audit_safety_regressions.py` | paid-before-preflight, rejected platform mutations, NaN/finite, bootstrap whitelist, secret redaction, cold start |
+| `test_audit_cli_regressions.py` | CLI wiring: jobs argv, report/download ownership, tunnel argv, install verify session forwarding |
+| `test_audit_smoke_regressions.py` | READY strictness: case identity/order, graph contract, cached samplers, no mtime grace, secrets entropy |
+| `test_audit_linux_operations.py` | real kernel locks: same-session operation exclusion, inherited FD, overdue without cancellation (Linux only) |
+| `test_audit2_platform.py` | create-response classification, post-paid SSH errors, agent-only auth, queue schema, service forwarding, release config |
+| `test_audit2_manifests.py` | manifest/URL strictness before payment, run-id and case-selection validation, report path containment |
+| `test_audit2_controller_locks.py` | per-thread operation contexts, true nesting, uncertain stop/destroy never releasing the lock |
+| `test_audit2_installer.py` | remote defense-in-depth manifest validation, atomic no-clobber publication, redaction |
+| `test_audit2_download.py` | download path containment, batch prevalidation, atomic no-clobber promotion |
+| `test_audit2_inference.py` | HTTP-inference lifetime vs management process, persistent fence, human `resolve-inference` rescue |
+| `test_audit2_linux_inference.py` | real FD held until terminal HTTP evidence, crashed watcher fence (Linux only) |
+
 `tests/mocks/` contains the scripted fake SSH runner (`fake_ssh.py`), the local
 Vast.ai API mock server (`vast_api_server.py`) and the in-process ComfyUI fake
 (`fake_comfy.py`).

@@ -11,6 +11,7 @@ while a session's jobs are alive.
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import subprocess
 import sys
@@ -27,12 +28,18 @@ def _new_job_id() -> str:
 
 
 def _job_dir(job_id: str) -> Path:
-    if "/" in job_id or ".." in job_id:
-        C.fail("E_USAGE", f"invalid job id: {job_id!r}")
-    return C.JOBS_DIR / job_id
+    try:
+        return C.confined_path(C.JOBS_DIR, C.validate_identifier(job_id, "job id"))
+    except ValueError as exc:
+        C.fail("E_USAGE", str(exc))
 
 
 def cmd_start(args) -> None:
+    # An SSH-delegated token does not carry the operation daemon's FD. Even
+    # inherited nested starts have ambiguous finalizer ownership: refuse both.
+    if os.environ.get("VAST_COMFY_OPERATION_TOKEN"):
+        C.fail("E_LOCK_CONFLICT", "Background jobs must acquire their own lease; nested job start is refused.",
+               exit_code=4)
     with C.operation(args.session_id, label=args.name) as lease:
         _start_job(args, lease)
 
@@ -42,6 +49,16 @@ def _start_job(args, lease) -> None:
     owner = C.ensure_owns(args.session_id)
     if not args.argv:
         C.fail("E_USAGE", "job start requires the command after '--'")
+    if not math.isfinite(args.timeout_seconds) or args.timeout_seconds <= 0:
+        C.fail("E_USAGE", "job timeout must be finite and positive")
+    if lease.fd is None:
+        C.fail("E_LOCK_NOT_HELD", "Job start requires an actual operation descriptor.", exit_code=4)
+    env = dict(os.environ)
+    for item in args.env or []:
+        key, separator, value = item.partition("=")
+        if not separator or not key or key.startswith("VAST_COMFY_"):
+            C.fail("E_USAGE", "Invalid or reserved job environment variable")
+        env[key] = value
     job_id = _new_job_id()
     job_dir = _job_dir(job_id)
     job_dir.mkdir(parents=True)
@@ -62,13 +79,8 @@ def _start_job(args, lease) -> None:
         {"state": "running", "started_at": C.now_epoch(), "pid": None, "exit_code": None},
     )
 
-    env = dict(os.environ)
     env["VAST_COMFY_JOB_DEADLINE"] = str(C.now_epoch() + args.timeout_seconds)
-    for item in args.env or []:
-        key, _, value = item.partition("=")
-        if not key:
-            C.fail("E_USAGE", f"invalid --env value: {item!r}")
-        env[key] = value
+    env["VAST_COMFY_JOB_ID"] = job_id
 
     runner = [
         sys.executable,
@@ -100,9 +112,8 @@ def _start_job(args, lease) -> None:
     lease.handoff()
     meta["pid"] = proc.pid
     C.atomic_write_json(job_dir / "meta.json", meta)
-    status = C.read_json(job_dir / "status.json", default={}) or {}
-    status["pid"] = proc.pid
-    C.atomic_write_json(job_dir / "status.json", status)
+    # The runner is the sole status writer after spawn. A parent read/replace
+    # here could overwrite a child's already-committed terminal status.
     C.emit(
         {
             "ok": True,
@@ -115,13 +126,17 @@ def _start_job(args, lease) -> None:
 
 
 def cmd_run(args) -> None:  # internal runner (_run)
-    job_dir = Path(args.job_dir)
+    job_dir = _job_dir(Path(args.job_dir).name)
+    if job_dir.resolve() != Path(args.job_dir).resolve():
+        C.fail("E_USAGE", "job directory escapes the managed jobs directory")
+    os.environ["VAST_COMFY_JOB_ID"] = job_dir.name
     status = {
         "state": "running",
         "started_at": C.now_epoch(),
         "pid": None,
         "exit_code": None,
         "timeout_seconds": args.timeout,
+        "runner_pid": os.getpid(),
     }
     C.atomic_write_json(job_dir / "status.json", status)
     log_path = job_dir / "log.txt"
@@ -139,8 +154,7 @@ def cmd_run(args) -> None:  # internal runner (_run)
                 )
             except FileNotFoundError as exc:
                 log_fh.write(f"\n[vast-comfy] command not found: {exc}\n".encode())
-                status.update({"state": "failed", "exit_code": 127, "ended_at": C.now_epoch()})
-                C.atomic_write_json(job_dir / "status.json", status)
+                rc = 127
                 sys.exit(1)
             status["pid"] = proc.pid
             C.atomic_write_json(job_dir / "status.json", status)
@@ -154,9 +168,21 @@ def cmd_run(args) -> None:  # internal runner (_run)
                 C.atomic_write_json(job_dir / "status.json", status)
                 rc = proc.wait()  # Retain the actual lock until work really ends.
                 state = "timeout"
+            # A crashed smoke watcher is not proof that its HTTP prompt ended.
+            # Keep the inherited FD as well as the durable fence; never retry
+            # submission, cancel inference, or turn this into terminal success.
+            while C.pending_inferences(job_id=job_dir.name):
+                state = "timeout"
+                status.update(state="overdue", child_exit_code=rc, job_may_still_be_running=True)
+                C.atomic_write_json(job_dir / "status.json", status)
+                time.sleep(1.0)
             log_fh.write(f"\n[vast-comfy] job finished: state={state} exit_code={rc}\n".encode())
     finally:
-        status.update({"state": state, "exit_code": rc, "ended_at": C.now_epoch()})
+        pending = C.pending_inferences(job_id=job_dir.name)
+        status.update({"state": "overdue" if pending else state, "exit_code": rc,
+                       "job_may_still_be_running": bool(pending)})
+        if not pending:
+            status["ended_at"] = C.now_epoch()
         C.atomic_write_json(job_dir / "status.json", status)
         token = os.environ.get("VAST_COMFY_OPERATION_TOKEN")
         if token:
@@ -173,18 +199,36 @@ def _load_job(job_id: str) -> tuple[Path, dict, dict]:
     return job_dir, meta, status
 
 
-def _effective_state(status: dict) -> str:
+def _effective_state(status: dict, *, meta=None, progress=None, pending=None) -> str:
     state = str(status.get("state", "running"))
+    runner_pid = status.get("runner_pid") or (meta or {}).get("pid")
+    if pending and (state not in ("running", "overdue") or not C.pid_alive(runner_pid)):
+        return "overdue"
+    if state in ("running", "overdue") and (progress or {}).get("state") == "overdue":
+        return "overdue"
     if state in ("running", "overdue"):
-        pid = status.get("pid")
+        pid = runner_pid or status.get("pid")
         if pid and not C.pid_alive(pid):
             return "crashed"
     return state
 
 
+def _job_state(job_dir, meta, status):
+    pending = C.pending_inferences(job_id=job_dir.name)
+    progress = C.read_json(job_dir / "progress.json", {}) or {}
+    if (pending and progress.get("state") != "overdue"
+            and isinstance(progress.get("deadline_at"), (int, float))
+            and C.now_epoch() >= progress["deadline_at"]):
+        # Report overdue even while the watcher is blocked in an HTTP request.
+        progress = {**progress, "state": "overdue", "reason": "SMOKE_TIMEOUT"}
+    state = _effective_state(status, meta=meta, progress=progress, pending=pending)
+    return state, pending, progress
+
+
 def cmd_status(args) -> None:
     job_dir, meta, status = _load_job(args.job_id)
-    state = _effective_state(status)
+    state, pending, progress = _job_state(job_dir, meta, status)
+    kernel_held = C.operation_held()
     C.emit(
         {
             "ok": True,
@@ -195,6 +239,13 @@ def cmd_status(args) -> None:
             "exit_code": status.get("exit_code"),
             "pid": status.get("pid"),
             "pid_alive": C.pid_alive(status.get("pid")),
+            "runner_pid": status.get("runner_pid") or meta.get("pid"),
+            "runner_alive": C.pid_alive(status.get("runner_pid") or meta.get("pid")),
+            "operation_kernel_held": kernel_held,
+            "persistent_hold": bool(pending),
+            "pending_inferences": pending,
+            "progress": progress,
+            "job_may_still_be_running": bool(pending) or state in ("running", "overdue"),
             "started_at": status.get("started_at"),
             "ended_at": status.get("ended_at"),
             "timeout_seconds": status.get("timeout_seconds"),
@@ -215,9 +266,9 @@ def cmd_logs(args) -> None:
         {
             "ok": True,
             "job_id": args.job_id,
-            "state": _effective_state(status),
+            "state": _job_state(job_dir, meta, status)[0],
             "tail_lines": args.tail,
-            "log": text,
+            "log": C.redact(text),
         }
     )
 
@@ -237,7 +288,7 @@ def cmd_list(args) -> None:
                 "job_id": meta.get("job_id"),
                 "name": meta.get("name"),
                 "session_id": meta.get("session_id"),
-                "state": _effective_state(status),
+                "state": _job_state(job_dir, meta, status)[0],
                 "created_at": meta.get("created_at"),
                 "ended_at": status.get("ended_at"),
             }

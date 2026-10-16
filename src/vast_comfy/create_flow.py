@@ -9,8 +9,7 @@ from . import prepare
 from .config import Config
 from .errors import E_NO_OFFERS, VastComfyError
 from .gpu import load_mapping
-from .instances import runner_for
-from .ssh import rental_preflight, wait_for_ssh
+from .ssh import rental_preflight
 from .vast.client import VastClient
 from .vast.offers import (
     build_search_query,
@@ -19,7 +18,7 @@ from .vast.offers import (
     raise_no_eligible,
     select_best,
 )
-from .vast.rental import create_instance, verify_offer, wait_for_running
+from .vast.rental import create_instance, verify_offer, wait_created, created_resource
 
 DEFAULT_LABEL_PREFIX = "vast-comfy"
 
@@ -100,6 +99,7 @@ def create_and_prepare(
     from .prepare import assert_no_remote_credentials, build_install_manifest
 
     assert_no_remote_credentials(build_install_manifest())
+    run_id, _, _ = prepare.smoke_request(cfg, run_id=run_id, cases=cases)
     if confirm_paid:
         rental_preflight(client, cfg)
 
@@ -113,13 +113,10 @@ def create_and_prepare(
 
     final_label = label or default_label(alias)
     created = create_instance(client, cfg, fresh, final_label, paid_confirmed=confirm_paid)
-    step("created", created)
-
-    try:
-        instance = wait_for_running(client, created["instance_id"], cfg, on_poll=lambda inst: step("waiting", inst))
+    with created_resource(created):
+        step("created", created)
+        instance, runner, _ = wait_created(client, cfg, created, on_poll=lambda inst: step("waiting", inst))
         step("running", {"instance_id": instance.get("id"), "gpu_name": instance.get("gpu_name")})
-        runner = runner_for(instance, cfg)
-        wait_for_ssh(runner, cfg)
         step("ssh_ok", {"ssh_host": instance.get("ssh_host"), "ssh_port": instance.get("ssh_port")})
         result = prepare.prepare_existing(
             runner,
@@ -131,15 +128,6 @@ def create_and_prepare(
             run_id=run_id,
             verify_model_shas=verify_model_shas,
         )
-    except VastComfyError as exc:
-        # Never mask the original error; add the instance reference and billing state.
-        exc.details.setdefault("instance_id", created["instance_id"])
-        exc.details.setdefault("label", final_label)
-        exc.details.setdefault(
-            "instance_billing",
-            "the instance was created and may still be billing; it was NOT stopped or destroyed",
-        )
-        raise
     result["label"] = final_label
     result["created"] = created
     return result

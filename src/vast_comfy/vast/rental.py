@@ -76,7 +76,10 @@ def verify_offer(
     """
     query = build_search_query(cfg, spec)
     query.pop("limit", None)
-    query["id"] = {"eq": int(offer_id)}
+    # The platform no longer honours an `id` predicate on bundle search (it
+    # silently matches nothing, which made every verify look like a vanished
+    # offer). `ask_contract_id` is the same value and still filters correctly.
+    query["ask_contract_id"] = {"eq": int(offer_id)}
     query["limit"] = 5
     offers = client.search_offers(query)
     matches = [o for o in offers if int(o.get("id", -1)) == int(offer_id)]

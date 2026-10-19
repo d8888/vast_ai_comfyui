@@ -249,5 +249,5 @@ def test_verify_offer_rechecks_with_an_id_filter_on_a_fresh_search(mapping):
     verified = verify_offer(client, cfg, spec, 1001)
     assert verified is fresh_offer
     query = client.calls[0][1][0]
-    assert query["id"] == {"eq": 1001}
+    assert query["ask_contract_id"] == {"eq": 1001}
     assert query["allocated_storage"] == 300.0  # still priced for the real disk

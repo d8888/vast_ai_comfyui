@@ -321,4 +321,8 @@ def test_no_code_path_deletes_the_lock_file():
     # The lock file is only ever opened with O_CREAT (create-if-missing) and
     # used through flock; release goes through release.request, not deletion.
     assert "O_CREAT" in common_src
-    assert "release.request" in session_src
+    # vc_session.py releases through the shared RELEASE_REQUEST constant
+    # (vc_common.RELEASE_REQUEST = LOCK_DIR / "release.request"), so the
+    # literal only appears in vc_common.py.
+    assert "RELEASE_REQUEST" in session_src
+    assert "release.request" in common_src

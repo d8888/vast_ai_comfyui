@@ -356,6 +356,129 @@ vast-comfy --env-file .env install run    --instance <ID> --session-id <SID>
 vast-comfy --env-file .env install verify --instance <ID> --session-id <SID>
 ```
 
+### 操作範例：新增一個模型
+
+一句話版本：改 [`config/models.yaml`](./config/models.yaml) → `config validate`（免費、不連機器）→ `install run`（instance 自己下載）→ `install verify`。
+
+**情境**：要加 SDXL 的 ControlNet 權重 `xinsir/controlnet-union-sdxl-1.0`（canny／depth／pose 多合一）。
+
+**第 1 步：查出 commit SHA、檔案大小與 sha256**
+
+`revision` 必須是 40 字元 commit SHA（寫 `main`／`latest` 會被拒絕）。HF 上 LFS 檔案的 `sha256` 就等於 API 回傳的 `lfs.oid`：
+
+```bash
+REPO=xinsir/controlnet-union-sdxl-1.0
+COMMIT=$(curl -s "https://huggingface.co/api/models/$REPO" | jq -r .sha)
+curl -s "https://huggingface.co/api/models/$REPO/tree/$COMMIT?recursive=1" \
+  | jq -r '.[] | select(.path=="diffusion_pytorch_model.safetensors")
+           | "\(.path)  size=\(.size)  sha256=\(.lfs.oid)"'
+```
+
+實際輸出（2026-10-20 查得，可直接對照）：
+
+```text
+diffusion_pytorch_model.safetensors  size=2512030408  sha256=a9e13fd61f3193887791c8a0dd07a07202174dc47d5ddaea94ea1344f07c7467
+```
+
+其中 `COMMIT` = `801a4a3fa3d4c936f4feea95b98607bc6726f80c`。
+
+**第 2 步：在 `config/models.yaml` 的 `models:` 下加一筆**
+
+```yaml
+  - id: sdxl-controlnet-union
+    purpose: "SDXL ControlNet Union（canny/depth/pose 等多合一）"
+    source:
+      type: huggingface
+      repo: xinsir/controlnet-union-sdxl-1.0
+      revision: 801a4a3fa3d4c936f4feea95b98607bc6726f80c
+      path: diffusion_pytorch_model.safetensors
+    dest: controlnet/xinsir_controlnet_union_sdxl.safetensors
+    sha256: a9e13fd61f3193887791c8a0dd07a07202174dc47d5ddaea94ea1344f07c7467
+    size_bytes: 2512030408
+```
+
+**第 3 步：先驗設定（不付費、不連線）**
+
+```bash
+vast-comfy --env-file .env config validate
+```
+
+這一步會檢查 YAML schema、必填欄位、重複 id／重複目的地、`dest` 是否在允許目錄、revision 是否為固定 SHA。有錯在這裡就會被擋下，不會走到付費階段。
+
+**第 4 步：安裝並驗證**
+
+```bash
+vast-comfy --env-file .env install run    --instance <ID> --session-id <SID>
+vast-comfy --env-file .env install verify --instance <ID> --session-id <SID>
+```
+
+`install run` 是背景 job（預設上限 `jobs.install_timeout_minutes: 90`），會等它結束才回來。`install verify` 回 `"ok": true` 即裝好；想順便重算 sha256 加 `--verify-shas`。
+
+**行為與限制**
+
+- 下載由 instance 直接進行（不經你的控制電腦），未完成檔與正式檔分離，校驗通過才轉正。
+- 目標檔已存在且 sha256 相符 → `skipped`；**不符 → `E_INSTALL_HASH_MISMATCH`，不會覆寫**。要換版本請自己先刪掉遠端那個檔案。
+- `dest` 第一層只接受：`diffusion_models`、`unet`、`text_encoders`、`clip`、`vae`、`controlnet`、`loras`、`embeddings`、`clip_vision`、`upscale_models`、`model_patches`、`ipadapter`、`style_models`、`audio_encoders`。
+- **`checkpoints` 不在允許清單**：整包 SDXL checkpoint（單檔含 UNet＋CLIP＋VAE）目前不能用這條路安裝；請改放 `diffusion_models` 等分件目錄，或自行處理。
+- Civitai 來源改成 `type: civitai` 加 `version_id: <數字>`（`https://civitai.com/api/download/models/<version_id>`）；`sha256` 仍要自己填對。
+- 需要登入才能下載的檔案（`auth_env`）在 v1 一律拒絕，避免把 token 送到機器上。
+
+### 操作範例：新增一個外掛
+
+**情境**：要裝 `Fannovel16/comfyui_controlnet_aux`，也就是 SDXL ControlNet 常用的預處理器（Canny、Depth、OpenPose…）。
+
+**第 1 步：取固定 commit**
+
+```bash
+curl -s "https://api.github.com/repos/Fannovel16/comfyui_controlnet_aux/commits?per_page=1" \
+  | jq -r '.[0].sha'
+```
+
+**第 2 步：加進 `config/models.yaml` 的 `plugins:`**
+
+```yaml
+  - id: comfyui-controlnet-aux
+    purpose: "ControlNet 預處理器（Canny/Depth/OpenPose…）"
+    repo_url: https://github.com/Fannovel16/comfyui_controlnet_aux
+    commit: a587a4c1594524c1d2de5cd1a86cd868ff448e1c
+    dest: custom_nodes/comfyui_controlnet_aux
+    required_nodes:
+      - AIO_Preprocessor
+      - ControlNetPreprocessorSelector
+```
+
+`dest` 只接受 `custom_nodes/<單一層目錄名>`；`commit` 必須是 40 字元 SHA。
+
+**第 3 步：驗設定後安裝**
+
+```bash
+vast-comfy --env-file .env config validate
+vast-comfy --env-file .env install run --instance <ID> --session-id <SID>
+```
+
+外掛是以 `git init` + `fetch --depth 1 <commit>` + `checkout --detach` 取得，並回查 `HEAD` 必須等於指定 commit。
+
+**第 4 步：重啟並確認節點真的載入**
+
+外掛裝好不會自動生效，ComfyUI 要重啟才會掃到新節點：
+
+```bash
+vast-comfy --env-file .env comfy restart  --instance <ID> --session-id <SID>
+vast-comfy --env-file .env comfy status   --instance <ID> --session-id <SID>
+vast-comfy --env-file .env comfy verify-nodes --instance <ID> --session-id <SID> \
+  --nodes "AIO_Preprocessor,ControlNetPreprocessorSelector"
+```
+
+- `comfy restart` 在佇列有工作時直接拒絕（`E_COMFY_BUSY`）：不清佇列、不插隊、不強制重啟。
+- `comfy status` 要看到 `api_ok: true` 才算活著。
+- `verify-nodes` 只要沒有列出缺少的節點即通過；`--nodes` 是逗號分隔，省略時檢查預設的 7 個必要節點。
+
+**行為與限制（重要）**
+
+- **`install run` 不會執行 `pip install`。** 若外掛需要額外 Python 套件（`comfyui_controlnet_aux` 需要 `opencv-python`、`scikit-image`、`einops`、`numpy` 等），少了套件 ComfyUI 啟動時 import 就會失敗，節點不會出現。這一步目前要你自己處理： SSH 進機器安裝，或用 `jobs start` 在遠端執行安裝指令（例如 `-- pip install -r custom_nodes/<name>/requirements.txt`）。v1 不代管外掛套件。
+- 外掛目標已存在但 commit 不符 → `E_INSTALL`；有本機修改 → `E_INSTALL_DIRTY`。**一律不 reset、不覆寫、不自動升版**，請自己解決衝突。
+- `required_nodes` 是給人看的宣告；實際的節點存在性以 `comfy verify-nodes` 的結果為準。
+
 ### 工作流
 
 - `workflows/gui/*.json`：在 ComfyUI 網頁 UI 開啟（4 套）。

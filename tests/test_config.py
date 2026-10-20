@@ -78,8 +78,8 @@ def test_missing_file_fails(tmp_path):
 @pytest.mark.parametrize(
     "body, match",
     [
-        ("ssh:\n  strategy: proxy_first\n", "ssh.strategy must be 'proxy_only'"),
-        ("ssh:\n  strategy: direct_only\n", "ssh.strategy must be 'proxy_only'"),
+        ("ssh:\n  strategy: proxy_first\n", "ssh.strategy must be one of"),
+        ("ssh:\n  strategy: bogus\n", "ssh.strategy must be one of"),
         ("image:\n  tag: latest\n", "image.tag must be a fixed version"),
         ("lock:\n  heartbeat_seconds: 300\n", "heartbeat_seconds must be smaller"),
         ("lock:\n  heartbeat_seconds: 400\n", "heartbeat_seconds must be smaller"),

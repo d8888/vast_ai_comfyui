@@ -346,10 +346,12 @@ def _validate_semantics(data: dict[str, Any]) -> None:
     _require_number(pricing["max_dph_total_usd_per_hour"], "pricing.max_dph_total_usd_per_hour", minimum=0.001)
 
     ssh = data["ssh"]
-    if ssh["strategy"] != "proxy_only":
+    if ssh["strategy"] not in ("proxy_only", "direct_only", "proxy_then_direct"):
         raise ConfigError(
-            "ssh.strategy must be 'proxy_only' for v1. "
-            "'proxy_first' and 'direct_only' are explicit out-of-scope extensions (SPEC.md section 7.1)."
+            "ssh.strategy must be one of 'proxy_only', 'direct_only' or 'proxy_then_direct'. "
+            "'proxy_only' uses only the sshN.vast.ai proxy endpoint; 'direct_only' uses the "
+            "published 22/tcp mapping; 'proxy_then_direct' prefers the proxy and falls back to "
+            "the direct mapping only on transport-level failures (SPEC.md section 7.1)."
         )
     if ssh["user"] != "root":
         raise ConfigError("ssh.user must be 'root' for Vast.ai Docker instances")

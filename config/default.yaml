@@ -62,7 +62,7 @@ pricing:
   max_dph_total_usd_per_hour: 2.0
 
 ssh:
-  strategy: "proxy_only"      # v1: only proxy_only is implemented
+  strategy: "proxy_only"      # proxy_only | direct_only | proxy_then_direct
   user: "root"
   key_path: null              # e.g. "~/.ssh/id_rsa" (private key, stays local)
   known_hosts_path: null      # default: <paths.root>/known_hosts

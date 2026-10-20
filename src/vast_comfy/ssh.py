@@ -18,7 +18,7 @@ import shlex
 import shutil
 import subprocess
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -65,6 +65,17 @@ class SSHContext:
     scp_timeout_seconds: int = 3600
     server_alive_interval_seconds: int = 20
     server_alive_count_max: int = 3
+    strategy: str = "proxy_only"
+    # Ordered extra endpoints tried only when the primary is unreachable at the
+    # transport level (E_SSH_CONNECT). Never used for auth/host-key failures.
+    fallbacks: list[tuple[str, int]] = field(default_factory=list)
+
+    def endpoints(self) -> list[tuple[str, int]]:
+        ordered = [(self.host, self.port)]
+        for endpoint in self.fallbacks:
+            if endpoint not in ordered:
+                ordered.append(endpoint)
+        return ordered
 
     def describe(self) -> dict[str, Any]:
         # Never include key material; paths are not secret.
@@ -74,25 +85,52 @@ class SSHContext:
             "user": self.user,
             "key_path": str(self.key_path) if self.key_path else None,
             "known_hosts_path": str(self.known_hosts_path) if self.known_hosts_path else None,
-            "strategy": "proxy_only",
+            "strategy": self.strategy,
+            "endpoints": [f"{self.user}@{h}:{p}" for h, p in self.endpoints()],
         }
+
+
+def direct_endpoint(instance: dict[str, Any]) -> tuple[str, int] | None:
+    """Direct-mapped SSH endpoint from the instance's published 22/tcp port.
+
+    Vast.ai publishes a direct port mapping separately from the sshN.vast.ai
+    proxy. The proxy is the documented default, but it can be unavailable while
+    the direct mapping works; that case is handled by ``ssh.strategy``.
+    """
+    mapping = (instance.get("ports") or {}).get("22/tcp") or []
+    ip = instance.get("public_ipaddr")
+    if not ip or not mapping:
+        return None
+    try:
+        host_port = int(mapping[0].get("HostPort"))
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if not 1 <= host_port <= 65535:
+        return None
+    return (str(ip), host_port)
 
 
 def context_from_instance(instance: dict[str, Any], cfg: Config) -> SSHContext:
     host = instance.get("ssh_host")
     port = instance.get("ssh_port")
+    strategy = str(cfg.require("ssh.strategy"))
+    direct = direct_endpoint(instance)
+    # direct_only uses the published 22/tcp mapping; proxy_then_direct prefers
+    # the proxy but may fail over. Neither relaxes host-key verification.
+    if (not host or not port) and direct is not None and strategy in ("direct_only", "proxy_then_direct"):
+        host, port = direct
     if not host or not port:
         raise VastComfyError(
             code=E_SSH_INFO_MISSING,
             message=(
-                "Instance has no proxy SSH endpoint (ssh_host/ssh_port). "
-                "vast-comfy v1 supports proxy-only SSH via instances created with runtype 'ssh_proxy'."
+                "Instance has no usable SSH endpoint (no ssh_host/ssh_port and no direct 22/tcp mapping)."
             ),
             stage="ssh",
-            details={"instance_id": instance.get("id")},
+            details={"instance_id": instance.get("id"), "strategy": strategy},
             hints=[
-                "Recreate the instance with this tool (it uses runtype ssh_proxy), "
-                "or operate through the Vast.ai console instead.",
+                "The instance publishes neither an sshN.vast.ai proxy endpoint nor a direct 22/tcp mapping.",
+                "Check ssh.strategy ('proxy_only', 'direct_only', 'proxy_then_direct') and recreate the instance "
+                "with runtype 'ssh_proxy' if proxy-only SSH (ssh_proxy) is required.",
             ],
         )
     paths = cfg.resolved_paths()
@@ -106,9 +144,25 @@ def context_from_instance(instance: dict[str, Any], cfg: Config) -> SSHContext:
         )
     known_hosts = paths["known_hosts_path"]
     known_hosts.parent.mkdir(parents=True, exist_ok=True)
+    chosen = (str(host), int(port))
+    fallbacks: list[tuple[str, int]] = []
+    if strategy == "direct_only":
+        if direct is None:
+            raise VastComfyError(
+                code=E_SSH_INFO_MISSING,
+                message=(
+                    "ssh.strategy is 'direct_only' but the instance publishes no direct 22/tcp mapping."
+                ),
+                stage="ssh",
+                details={"instance_id": instance.get("id")},
+                hints=["Switch ssh.strategy to 'proxy_only' or 'proxy_then_direct'."],
+            )
+        chosen = direct
+    elif strategy == "proxy_then_direct" and direct is not None and direct != chosen:
+        fallbacks = [direct]
     return SSHContext(
-        host=str(host),
-        port=int(port),
+        host=chosen[0],
+        port=chosen[1],
         user=str(cfg.require("ssh.user")),
         key_path=Path(key_path) if key_path else None,
         known_hosts_path=known_hosts,
@@ -117,6 +171,8 @@ def context_from_instance(instance: dict[str, Any], cfg: Config) -> SSHContext:
         scp_timeout_seconds=int(cfg.require("ssh.scp_timeout_seconds")),
         server_alive_interval_seconds=int(cfg.require("ssh.server_alive_interval_seconds")),
         server_alive_count_max=int(cfg.require("ssh.server_alive_count_max")),
+        strategy=strategy,
+        fallbacks=fallbacks,
     )
 
 
@@ -140,14 +196,22 @@ def _common_opts(ctx: SSHContext) -> list[str]:
     return opts
 
 
+def ssh_args_for(ctx: SSHContext, host: str, port: int) -> list[str]:
+    """SSH argv for one concrete endpoint (options precede the destination)."""
+    return ["ssh", "-p", str(port), *_common_opts(ctx), f"{ctx.user}@{host}"]
+
+
+def scp_args_for(ctx: SSHContext, host: str, port: int) -> list[str]:
+    return ["scp", "-P", str(port), *_common_opts(ctx)]
+
+
 def ssh_base_args(ctx: SSHContext) -> list[str]:
-    return ["ssh", "-p", str(ctx.port), *_common_opts(ctx), f"{ctx.user}@{ctx.host}"]
+    return ssh_args_for(ctx, ctx.host, ctx.port)
 
 
 def scp_base_args(ctx: SSHContext) -> list[str]:
-    args = ["scp", "-P", str(ctx.port), *_common_opts(ctx)]
     # Path-sensitive users (Windows scp needs no special flags; -O forces legacy protocol)
-    return args
+    return scp_args_for(ctx, ctx.host, ctx.port)
 
 
 @dataclass
@@ -278,11 +342,24 @@ class SSHRunner:
         self.ctx = ctx
         self.dry_run = dry_run
         self._scp_sftp_default: bool | None = None
+        self._active_endpoint: tuple[str, int] | None = None
+
+    # -- endpoint selection -----------------------------------------------
+
+    def active_endpoint(self) -> tuple[str, int]:
+        """The endpoint that last worked (or the primary one before any attempt)."""
+        return self._active_endpoint or (self.ctx.host, self.ctx.port)
+
+    def _try_next(self, code: str, index: int) -> bool:
+        """Only transport-level failures may fail over; auth/host-key never do."""
+        return code == E_SSH_CONNECT and index + 1 < len(self.ctx.endpoints())
 
     # -- command execution ------------------------------------------------
 
-    def build_remote_argv(self, argv: Sequence[str]) -> list[str]:
-        return [*ssh_base_args(self.ctx), shlex.join(list(argv))]
+    def build_remote_argv(self, argv: Sequence[str], *,
+                          endpoint: tuple[str, int] | None = None) -> list[str]:
+        host, port = endpoint or self.active_endpoint()
+        return [*ssh_args_for(self.ctx, host, port), shlex.join(list(argv))]
 
     def run_remote(
         self,
@@ -292,8 +369,36 @@ class SSHRunner:
         check: bool = True,
         input_bytes: bytes | None = None,
     ) -> CommandResult:
-        full = self.build_remote_argv(argv)
-        return self._execute(full, timeout_seconds=timeout_seconds, check=check, input_bytes=input_bytes)
+        endpoints = self.ctx.endpoints()
+        last_error: VastComfyError | None = None
+        for index, endpoint in enumerate(endpoints):
+            full = self.build_remote_argv(argv, endpoint=endpoint)
+            try:
+                result = self._execute(
+                    full, timeout_seconds=timeout_seconds, check=check, input_bytes=input_bytes
+                )
+            except VastComfyError as exc:
+                if self._try_next(exc.code, index):
+                    logger.info("SSH endpoint %s:%s unreachable (%s); trying the next endpoint",
+                                endpoint[0], endpoint[1], exc.code)
+                    last_error = exc
+                    continue
+                raise
+            self._active_endpoint = endpoint
+            if check or result.rc == 0:
+                return result
+            if self._try_next(classify_ssh_failure(result.stderr, result.rc), index):
+                logger.info("SSH endpoint %s:%s unreachable; trying the next endpoint",
+                            endpoint[0], endpoint[1])
+                continue
+            return result
+        if last_error is not None:
+            raise last_error
+        raise VastComfyError(
+            code=E_SSH_CONNECT,
+            message="No SSH endpoint for this instance could be reached.",
+            stage="ssh",
+        )
 
     def run_script(self, script: str, *, timeout_seconds: int | None = None, check: bool = True) -> CommandResult:
         return self.run_remote(["bash", "-lc", script], timeout_seconds=timeout_seconds, check=check)
@@ -389,16 +494,37 @@ class SSHRunner:
     # -- file transfer ----------------------------------------------------
 
     def upload(self, local_path: Path | str, remote_path: str) -> None:
-        self._scp([str(local_path), f"{self.ctx.user}@{self.ctx.host}:{remote_path}"],
-                  direction="upload", remote_path=remote_path)
+        self._scp(str(local_path), remote_path, direction="upload")
 
     def download(self, remote_path: str, local_path: Path | str) -> None:
-        self._scp([f"{self.ctx.user}@{self.ctx.host}:{remote_path}", str(local_path)],
-                  direction="download", remote_path=remote_path)
+        self._scp(str(local_path), remote_path, direction="download")
 
-    def _scp(self, operands: list[str], *, direction: str, remote_path: str) -> None:
+    def _scp(self, local_path: str, remote_path: str, *, direction: str) -> None:
+        endpoints = self.ctx.endpoints()
+        last_error: VastComfyError | None = None
+        for index, endpoint in enumerate(endpoints):
+            try:
+                self._scp_endpoint(endpoint, local_path, remote_path, direction=direction)
+            except VastComfyError as exc:
+                if self._try_next(exc.code, index):
+                    logger.info("scp endpoint %s:%s unreachable (%s); trying the next endpoint",
+                                endpoint[0], endpoint[1], exc.code)
+                    last_error = exc
+                    continue
+                raise
+            self._active_endpoint = endpoint
+            return
+        if last_error is not None:
+            raise last_error
+
+    def _scp_endpoint(self, endpoint: tuple[str, int], local_path: str, remote_path: str, *,
+                      direction: str) -> None:
+        host, port = endpoint
+        remote = f"{self.ctx.user}@{host}:{remote_path}"
+        operands = [local_path, remote] if direction == "upload" else [remote, local_path]
+
         def args(legacy: bool) -> list[str]:
-            base = scp_base_args(self.ctx)
+            base = scp_args_for(self.ctx, host, port)
             if legacy:
                 base.append("-O")
             return [*base, *operands]
@@ -486,15 +612,16 @@ class SSHRunner:
         OpenSSH treats everything after the destination as a remote command, so
         ``-N``/``-L`` must come before ``user@host`` or no tunnel is created.
         """
+        host, port = self.active_endpoint()
         return [
             "ssh",
             "-p",
-            str(self.ctx.port),
+            str(port),
             *_common_opts(self.ctx),
             "-N",
             "-L",
             f"127.0.0.1:{local_port}:localhost:{remote_port}",
-            f"{self.ctx.user}@{self.ctx.host}",
+            f"{self.ctx.user}@{host}",
         ]
 
 

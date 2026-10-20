@@ -173,7 +173,7 @@ vast-comfy gpu add-alias --alias my_4090 --gpu-name "RTX 4090"
 | 架構 | NVIDIA CUDA、x86-64 |
 | Image 相容性 | `cuda_max_good ≥ 12.9`、`compute_cap ≥ 750`（對應固定的 CUDA 12.9 image） |
 | 地區 | 預設不限；可用 `host.geolocation_allow` / `host.geolocation_exclude` |
-| SSH | `proxy_only`（v1 唯一策略） |
+| SSH | `ssh.strategy`：`proxy_only`（預設）／`direct_only`（官方 22/tcp 直連）／`proxy_then_direct`（proxy 優先，傳輸層失敗才退回直連） |
 
 全部都是硬性條件：**沒有任何一項會被私下放寬**。無合格 offer 或超預算都會失敗，不會換 GPU、不會加價、不會自動改租。
 
@@ -235,14 +235,26 @@ vast-comfy --env-file .env flow create-and-prepare \
 
 ## 7. 連線：Proxy SSH、SSH tunnel 與官方 Portal
 
-### Proxy SSH（v1 唯一策略）
+### Proxy SSH
+
+三種策略（`ssh.strategy`）：
+
+| 值 | 行為 |
+|---|---|
+| `proxy_only`（預設） | 只用 `ssh_host:ssh_port`（Vast.ai proxy）；直接連線埠即使存在也被刻意忽略 |
+| `direct_only` | 只用 `public_ipaddr` + 發佈的 `22/tcp` HostPort |
+| `proxy_then_direct` | 優先 proxy，僅在**傳輸層**不可達（`E_SSH_CONNECT`）時退回直連 |
+
+退回只針對連線層錯誤（`kex_exchange_identification`、connection reset、逾時）。認證失敗與主機金鑰變更**永不**觸發退回，也不會為了連上而關閉驗證。
+
+實務上 proxy 端點可能失效而 direct 埠正常：`sshN.vast.ai` 回 `Connection reset` 時，`--set ssh.strategy=direct_only` 即可繼續操作同一台機器。
 
 ```bash
 vast-comfy --env-file .env ssh info --instance <ID>   # 連線資訊 + tunnel 指令 + Portal 資訊
 vast-comfy --env-file .env ssh test --instance <ID>   # 實際登入並執行命令才算通過
 ```
 
-- 使用 instance 的 `ssh_host:ssh_port`（Vast.ai proxy 位址）；直接連線埠即使存在也會被刻意忽略。
+- 使用 instance 的 `ssh_host:ssh_port`（Vast.ai proxy 位址）；`proxy_only` 下直接連線埠即使存在也會被刻意忽略。
 - SSH 就緒標準是「實際登入且命令成功」，不是 TCP 埠可連。
 
 ### SSH tunnel（主要存取方式）
@@ -569,6 +581,7 @@ vast-comfy --env-file .env download outputs --instance <ID> --session-id <SID> -
 - `stop`：保留資料，**仍持續收硬碟費**；重新啟動不保證取回原 GPU。
 - `destroy`：**永久刪除 instance 內所有資料**（本工具 v1 不使用獨立 volume）。需要 `--confirm-destroy`，同意租用不等於同意刪資料。
 - `stop`／`destroy` 也是**修改操作**：必須指定仍持有獨占權的 session（`--session-id`），執行前會先取得遠端操作鎖並驗證所有權；API 未確認成功時回報 `E_UPSTREAM`，不假裝已停止或已銷毀。
+- `destroy` 在 `running` 與已停止（`exited`／`stopped`／`offline`／`unknown`）狀態都可用：**先 `stop` 省錢再 `destroy` 退租是正常順序**，不會因為已停止就被拒。已停止狀態沒有 SSH、也沒有遠端工作，此時不建立遠端操作鎖，結果中的 `lock_state` 會如實標示。狀態仍在轉移（`creating`／`scheduling`／`starting`）時會拒絕，避免對狀態未定的機器動手。
 - 因為 API 逾時、5xx、畸形回應或中斷都可能發生在受理之後，`stop`／`destroy` 在送出請求**之前**即設定保留操作鎖；成功或出錯都不會自動解除。錯誤會揭露 action outcome、instance／session 與可能計費狀態，由你在管理頁面查證後接手，不能盲目重送。
 
 ```bash
@@ -679,7 +692,8 @@ Python API 與 CLI 共用同一套驗證、硬條件檢查與執行邏輯；失�
 | 心跳過期訊息 | 只是回報。先確認舊持有者與其工作是否真的結束；沒有存活工作才能復原 |
 | `E_COMFY_BUSY` | ComfyUI 有排隊中的生成工作。等它跑完；本工具不清佇列、不強制重啟 |
 | `E_JOB_TIMEOUT` | 等待超時 ≠ 工作停止。用 `jobs status`／`jobs logs` 追蹤 |
-| instance `offline`／`stopped` | v1 無法在無法驗證遠端鎖時安全操作；請在 Vast.ai 管理頁面處理，SSH 恢復後再回工具 |
+| instance `offline`／`stopped` | 無法驗證遠端鎖時不做容器內操作；但 `instance destroy` 在這些狀態仍可執行（沒有遠端工作需要排他）。狀態轉移中（`creating`／`starting`）請等它穩定 |
+| Vast.ai proxy 連不上（`kex_exchange_identification`／connection reset） | proxy 端點壞掉但 direct 埠正常。用 `--set ssh.strategy=direct_only`（或 `proxy_then_direct`）重試；勿關閉主機驗證 |
 | smoke 失敗看哪裡 | `smoke report --run-id <RUN>` 或 `jobs logs`；報告與圖片都在遠端 |
 
 ---

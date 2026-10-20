@@ -143,8 +143,12 @@ GPU 數量是精確要求，不是「至少」。租用多張 GPU 仍只執行�
 
 ### 7.1 SSH
 
-- v1 只有 `proxy_only`：使用 Vast.ai proxy，不自動切換 direct。
-- `proxy_first`、`direct_only` 列為後續擴充，不納入 v1 實作要求。
+- `ssh.strategy` 三種策略：
+  - `proxy_only`（預設）：只用 Vast.ai proxy，不自動切換 direct。
+  - `direct_only`：只用 instance 發佈的 `public_ipaddr` + `22/tcp` HostPort。
+  - `proxy_then_direct`：優先用 proxy，proxy 在**傳輸層**不可達時才退回 direct。
+- 退回僅限 `E_SSH_CONNECT`（例如 `kex_exchange_identification`、connection reset、連線逾時）。認證失敗與主機金鑰變更**永不**觸發退回，也不得以換策略為理由放寬驗證。
+- 實務背景：Vast.ai proxy 端點可能失效而 direct 埠正常，反之亦然；`proxy_only` 在該情況下無法操作 instance。
 - 使用 Windows／Linux OpenSSH；原生支援使用者提供的 `id_rsa` 與 `id_rsa.pub`，以及 `ssh-agent`。
 - 不支援 PuTTY／PPK，不加入相關轉換或 Plink 路徑。
 - 公鑰註冊及新金鑰建立為明確工具操作；不覆寫既有金鑰。租用前確認所需公鑰已註冊。
@@ -412,6 +416,8 @@ JSON 供 Agent 使用，Markdown 供使用者閱讀。報告留遠端，透過�
 - 程式失敗退出、本機關閉或 session 釋放，不代表 instance 已停止，也不代表計費已停止。
 - `stop` 仍可能繼續收取儲存費，且重新啟動不保證原 GPU 資源可用。
 - `destroy` 會刪除 instance 內資料；對本規格未另租 volume 的情境，必須提醒使用者先保存重要資料。
+- `destroy` 必須在 `running` 與已停止狀態（`exited`／`stopped`／`offline`／`unknown`）都可執行：先停機省錢再退租是正常順序，不得因為已停止就拒絕。已停止狀態沒有 SSH、也就不存在遠端工作，該情況下不建立遠端操作鎖，並在結果中如實標示 `lock_state`。
+- 狀態仍在轉移（如 `creating`／`scheduling`／`starting`）時拒絕 `destroy`，避免對狀態未定的機器動手；提示使用者待其穩定後重試或改用管理頁面。
 - README 必須清楚說明上述費用、資料保存及使用者手動管理責任。
 
 ## 16. 組合流程

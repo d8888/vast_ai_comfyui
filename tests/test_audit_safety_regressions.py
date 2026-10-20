@@ -54,6 +54,7 @@ def test_common_real_cli_entrypoint(repo_root):
 def test_lifecycle_conflict_prevents_platform_mutation(cfg, monkeypatch, action):
     client = Mock()
     monkeypatch.setattr(lifecycle, "load_runner", lambda *_: ({"actual_status": "running"}, Mock()))
+    monkeypatch.setattr(lifecycle, "live_instance", lambda *_: {"actual_status": "running"})
     @contextlib.contextmanager
     def denied(*a, **kw):
         raise VastComfyError("E_LOCK_CONFLICT", "another operation")

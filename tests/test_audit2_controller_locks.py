@@ -81,6 +81,7 @@ def test_failed_begin_releases_local_guard_for_diagnosis(cfg, protocol):
 def test_uncertain_platform_mutation_never_ends_operation(cfg, protocol, monkeypatch, action, failure):
     runner = SimpleNamespace()
     monkeypatch.setattr(lifecycle, "load_runner", lambda *_: ({}, runner))
+    monkeypatch.setattr(lifecycle, "live_instance", lambda *_: {"actual_status": "running"})
     client = Mock()
     getattr(client, action + "_instance").side_effect = failure
     with pytest.raises(VastComfyError) as error:
@@ -97,8 +98,64 @@ def test_uncertain_platform_mutation_never_ends_operation(cfg, protocol, monkeyp
 @pytest.mark.parametrize("action", ["stop", "destroy"])
 def test_successful_mutation_also_retains_exclusion(cfg, protocol, monkeypatch, action):
     monkeypatch.setattr(lifecycle, "load_runner", lambda *_: ({}, SimpleNamespace()))
+    monkeypatch.setattr(lifecycle, "live_instance", lambda *_: {"actual_status": "running"})
     client = Mock()
     if action == "stop": result = lifecycle.stop(client, cfg, 123, "S")
     else: result = lifecycle.destroy(client, cfg, 123, "S", confirm_destroy=True)
     assert result[action + "_requested"] is True
     assert [c.args[3][0] for c in protocol.call_args_list] == ["begin-operation"]
+
+
+# ---------------------------------------------------------------------------
+# Destroy must stay usable in the normal money-saving order (stop, then destroy)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("status", ["exited", "stopped", "offline", "unknown"])
+def test_destroy_allowed_when_no_remote_work_can_exist(cfg, protocol, monkeypatch, status):
+    monkeypatch.setattr(lifecycle, "live_instance", lambda *_: {"actual_status": status})
+    monkeypatch.setattr(
+        lifecycle, "load_runner",
+        lambda *_: pytest.fail("a stopped instance has no SSH; no runner may be built"),
+    )
+    client = Mock()
+    result = lifecycle.destroy(client, cfg, 123, "S", confirm_destroy=True)
+    assert result["destroy_requested"] is True
+    assert result["actual_status_at_request"] == status
+    assert "not taken" in result["lock_state"]
+    client.destroy_instance.assert_called_once_with(123)
+    # No remote lock protocol is spoken: there is nothing to exclude.
+    assert protocol.call_args_list == []
+
+
+@pytest.mark.parametrize("status", ["exited", "stopped"])
+def test_destroy_in_stopped_state_never_retries_and_reports_unknown(cfg, protocol, monkeypatch, status):
+    monkeypatch.setattr(lifecycle, "live_instance", lambda *_: {"actual_status": status})
+    client = Mock()
+    client.destroy_instance.side_effect = KeyboardInterrupt()
+    with pytest.raises(VastComfyError) as error:
+        lifecycle.destroy(client, cfg, 123, "S", confirm_destroy=True)
+    assert error.value.details["action_outcome"] == "unknown"
+    assert error.value.details["instance_may_be_billing"] is True
+    assert error.value.details["actual_status"] == status
+    client.destroy_instance.assert_called_once_with(123)
+
+
+@pytest.mark.parametrize("status", ["creating", "scheduling", "starting"])
+def test_destroy_refused_while_state_is_still_transitioning(cfg, protocol, monkeypatch, status):
+    monkeypatch.setattr(lifecycle, "live_instance", lambda *_: {"actual_status": status})
+    client = Mock()
+    with pytest.raises(VastComfyError) as error:
+        lifecycle.destroy(client, cfg, 123, "S", confirm_destroy=True)
+    assert error.value.code == "E_INSTANCE_STATE"
+    assert error.value.details["actual_status"] == status
+    client.destroy_instance.assert_not_called()
+
+
+def test_destroy_still_requires_explicit_confirmation(cfg, protocol, monkeypatch):
+    monkeypatch.setattr(lifecycle, "live_instance", lambda *_: {"actual_status": "exited"})
+    client = Mock()
+    with pytest.raises(Exception) as error:
+        lifecycle.destroy(client, cfg, 123, "S")
+    assert getattr(error.value, "code", None) in ("E_APPROVAL_REQUIRED", None)
+    client.destroy_instance.assert_not_called()

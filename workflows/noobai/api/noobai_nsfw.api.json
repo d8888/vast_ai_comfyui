@@ -1,0 +1,107 @@
+{
+  "1": {
+    "class_type": "CheckpointLoaderSimple",
+    "inputs": {
+      "ckpt_name": "NoobAI-XL-v1.1.safetensors"
+    },
+    "_meta": {
+      "title": "Load NoobAI-XL v1.1 (SDXL checkpoint)"
+    }
+  },
+  "2": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "text": "masterpiece, best quality, newest, absurdres, highres, 1girl, solo, beach, summer, ocean, sunny day, bikini, swimsuit, bare shoulders, summer dress, tanned skin, tan lines, wet skin, water droplets, looking at viewer, smile, long blonde hair, blue eyes, white skin, slender waist, long legs, detailed body",
+      "clip": [
+        "1",
+        1
+      ]
+    },
+    "_meta": {
+      "title": "Positive prompt (NSFW-safe: swimwear, no suppression)"
+    }
+  },
+  "3": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "text": "nsfw, worst quality, old, early, low quality, lowres, signature, username, logo, bad hands, mutated hands, bad anatomy, extra limbs, missing limbs, fused fingers, mammal, anthro, furry, ambiguous form, feral, semi-anthro",
+      "clip": [
+        "1",
+        1
+      ]
+    },
+    "_meta": {
+      "title": "Negative prompt (kept for a deliberate no-op regression; overridden per case)"
+    }
+  },
+  "4": {
+    "class_type": "EmptyLatentImage",
+    "inputs": {
+      "width": 832,
+      "height": 1216,
+      "batch_size": 1
+    },
+    "_meta": {
+      "title": "Empty latent 832x1216 (portrait, matches a standing figure)"
+    }
+  },
+  "5": {
+    "class_type": "KSampler",
+    "inputs": {
+      "seed": 12345,
+      "steps": 28,
+      "cfg": 5.5,
+      "sampler_name": "euler_ancestral",
+      "scheduler": "normal",
+      "denoise": 1.0,
+      "model": [
+        "1",
+        0
+      ],
+      "positive": [
+        "2",
+        0
+      ],
+      "negative": [
+        "3",
+        0
+      ],
+      "latent_image": [
+        "4",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "KSampler (28 steps, CFG 5.5)"
+    }
+  },
+  "6": {
+    "class_type": "VAEDecode",
+    "inputs": {
+      "samples": [
+        "5",
+        0
+      ],
+      "vae": [
+        "1",
+        2
+      ]
+    },
+    "_meta": {
+      "title": "VAE Decode"
+    }
+  },
+  "7": {
+    "class_type": "SaveImage",
+    "inputs": {
+      "images": [
+        "6",
+        0
+      ],
+      "filename_prefix": "vast_comfy_smoke_noobai_nsfw"
+    },
+    "_meta": {
+      "title": "Save image (vast_comfy_smoke_noobai_nsfw)"
+    }
+  }
+}

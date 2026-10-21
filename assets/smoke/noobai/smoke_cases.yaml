@@ -51,10 +51,6 @@ cases:
     expect_sampler: {steps: 28, cfg: 5.5}
     inputs: []
     overrides:
-      # The negative prompt must NOT contain the token "nsfw": putting it there
-      # makes the sampler suppress exactly what this profile is meant to render.
-      "3":
-        text: "worst quality, old, early, low quality, lowres, signature, username, logo, bad hands, mutated hands, bad anatomy, extra limbs, missing limbs, fused fingers, mammal, anthro, furry, ambiguous form, feral, semi-anthro"
       "5": {seed: "$run_seed"}
     expect:
       width: 832

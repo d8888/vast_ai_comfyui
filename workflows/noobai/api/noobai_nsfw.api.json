@@ -24,14 +24,14 @@
   "3": {
     "class_type": "CLIPTextEncode",
     "inputs": {
-      "text": "nsfw, worst quality, old, early, low quality, lowres, signature, username, logo, bad hands, mutated hands, bad anatomy, extra limbs, missing limbs, fused fingers, mammal, anthro, furry, ambiguous form, feral, semi-anthro",
+      "text": "worst quality, old, early, low quality, lowres, signature, username, logo, bad hands, mutated hands, bad anatomy, extra limbs, missing limbs, fused fingers, mammal, anthro, furry, ambiguous form, feral, semi-anthro",
       "clip": [
         "1",
         1
       ]
     },
     "_meta": {
-      "title": "Negative prompt (kept for a deliberate no-op regression; overridden per case)"
+      "title": "Negative prompt (must NOT contain the token nsfw — see assets/smoke/noobai/README)"
     }
   },
   "4": {

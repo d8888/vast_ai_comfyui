@@ -1,9 +1,10 @@
 # vast-comfy
 
-以硬性條件在 Vast.ai 上找到**報價最低**的合格 GPU instance，明確授權後租用，部署官方 ComfyUI image、Anima 模型家族與 Anima-LLLite 外掛，並以**實際出圖**驗收可用性。
+以硬性條件在 Vast.ai 上找到**報價最低**的合格 GPU instance，明確授權後租用，部署官方 ComfyUI image 與所選**模型 profile**（Anima 家族＋Anima-LLLite，或 NoobAI-XL SDXL），並以**實際出圖**驗收可用性。除此之外還有一條獨立的 **LoRA 訓練線**：少量圖 → WD14 標註 → SDXL LoRA → 同 seed 開關驗證。
 
 - 完整已批准規格： [`SPEC.md`](./SPEC.md)
-- 本 README 對應規格版本 1.0。**目前尚未做過真機付費驗收**（見文末「驗證狀態」）。
+- 本 README 對應規格版本 1.0，並反映 `7804036` 之後的所有實作變更（profile 化、外掛 requirements、參考圖上傳、NSFW 案例、LoRA 線）。
+- 真機驗收狀態見文末「驗證狀態」——兩個 profile 都已在租來的 RTX 3090 上跑到 READY。
 
 ---
 
@@ -19,14 +20,17 @@
 8. [獨占 session、心跳與衝突處置](#8-獨占-session心跳與衝突處置)
 9. [背景 job：狀態、日誌、等待與錯誤接手](#9-背景-job狀態日誌等待與錯誤接手)
 10. [模型、外掛與固定版本](#10-模型外掛與固定版本)
+10b. [Profile：一個工具、多個模型家族](#10b-profile一個工具多個模型家族)
 11. [Smoke test 與 READY 判定](#11-smoke-test-與-ready-判定)
 12. [下載圖片／報告／outputs](#12-下載圖片報告outputs)
 13. [檔案傳輸邊界與安全](#13-檔案傳輸邊界與安全)
 14. [費用、資料保存與 stop／destroy](#14-費用資料保存與-stopdestroy)
 15. [命令與 JSON 契約](#15-命令與-json-契約)
 16. [常見問題排解](#16-常見問題排解)
-17. [模型授權與驗收範圍](#17-模型授權與驗收範圍)
-18. [驗證狀態](#18-驗證狀態)
+17. [參考圖與實驗素材](#17-參考圖與實驗素材)
+18. [LoRA 訓練線](#18-lora-訓練線)
+19. [模型授權與驗收範圍](#19-模型授權與驗收範圍)
+20. [驗證狀態](#20-驗證狀態)
 
 ---
 
@@ -133,6 +137,7 @@ vast-comfy keys list
 
 **內建預設 → YAML（`--config`）→ 明確 CLI 參數（`--set PATH=VALUE`）**
 
+- `--profile NAME` 是 `--set profile=NAME` 的語法糖：解析後的設定仍是唯一真實來源，明確的 `--set profile=X` 優先。詳見第 10b 節。
 - 未知欄位、重複 YAML key、型別／範圍／矛盾設定、未知 alias 一律在任何副作用前失敗。
 - `config/default.yaml` 是「內建預設的參考副本」，由測試確保同步。全部預設值見該檔。
 - 逾時類設定為執行期實際生效值：`jobs.smoke_case_timeout_minutes` 會套用到**每個** smoke case（覆蓋案例檔內建值），`comfy.health_timeout_seconds` 為 health 檢查的命令逾時，其餘（安裝、啟動等待、SSH 就緒、restart 等待）同樣以設定為準；修改後即為該次操作的硬性上限。
@@ -343,7 +348,9 @@ vast-comfy --env-file .env jobs list    --instance <ID>
 
 ## 10. 模型、外掛與固定版本
 
-清單在 [`config/models.yaml`](./config/models.yaml)，全部固定 revision／commit 與 sha256：
+清單**按 profile 分檔**，全部固定 revision／commit 與 sha256。`config/models.yaml` 已不存在（不再重複維護一份）。
+
+**`config/profiles/anima.yaml`**（Anima 家族，分件式模型）
 
 | 檔案 | 大小 | 目的地（ComfyUI） |
 | --- | --- | --- |
@@ -354,6 +361,16 @@ vast-comfy --env-file .env jobs list    --instance <ID>
 | `anima-lllite-any-test-like-v2.safetensors` | 16 MB | `models/controlnet/` |
 | `anima-lllite-inpainting-v2.safetensors` | 63 MB | `models/controlnet/` |
 | 外掛 `kohya-ss/ComfyUI-Anima-LLLite`（commit `b7495bd`）| — | `custom_nodes/ComfyUI-Anima-LLLite` |
+
+**`config/profiles/noobai.yaml`**（SDXL 單檔 checkpoint，預設 profile）
+
+| 檔案 | 大小 | 目的地（ComfyUI） |
+| --- | --- | --- |
+| `NoobAI-XL-v1.1.safetensors` | 7.1 GB | `models/checkpoints/` |
+| `controlnet-union-sdxl-1.0.safetensors` | 2.5 GB | `models/controlnet/` |
+| 外掛 `Fannovel16/comfyui_controlnet_aux`（commit `a587a4c`）| — | `custom_nodes/ComfyUI_controlnet_aux` |
+
+NoobAI-XL 是單檔 SDXL checkpoint（CLIP＋VAE 內建），走 `CheckpointLoaderSimple`；Anima 是 UNET／text encoder／VAE 分件，走 `UNETLoader`／`CLIPLoader`／`VAELoader`。這個差異就是 profile 機制存在的理由。
 
 安裝規則：
 
@@ -368,9 +385,21 @@ vast-comfy --env-file .env install run    --instance <ID> --session-id <SID>
 vast-comfy --env-file .env install verify --instance <ID> --session-id <SID>
 ```
 
+### 上傳自己的參考圖
+
+ControlNet／img2img 需要機器上有一張輸入圖。不要手動 scp 進 container，用命令讓它做校驗：
+
+```bash
+vast-comfy --env-file .env comfy upload-image --instance <ID> --session-id <SID> \
+  --file ./my_pose.png --name my_pose.png
+```
+
+- 只接受 `.png`，有大小上限；先 scp 到 runtime staging，遠端**驗 sha256**通過才發布到 ComfyUI 的 `input/`，半截傳輸永遠不會被 workflow 看到。
+- 同名但內容不同的檔案**不會**被覆蓋。
+
 ### 操作範例：新增一個模型
 
-一句話版本：改 [`config/models.yaml`](./config/models.yaml) → `config validate`（免費、不連機器）→ `install run`（instance 自己下載）→ `install verify`。
+一句話版本：改對應 profile 的 [`config/profiles/<profile>.yaml`](./config/profiles/) → `config validate`（免費、不連機器）→ `install run`（instance 自己下載）→ `install verify`。
 
 **情境**：要加 SDXL 的 ControlNet 權重 `xinsir/controlnet-union-sdxl-1.0`（canny／depth／pose 多合一）。
 
@@ -394,7 +423,9 @@ diffusion_pytorch_model.safetensors  size=2512030408  sha256=a9e13fd61f319388779
 
 其中 `COMMIT` = `801a4a3fa3d4c936f4feea95b98607bc6726f80c`。
 
-**第 2 步：在 `config/models.yaml` 的 `models:` 下加一筆**
+**第 2 步：在 `config/profiles/<profile>.yaml` 的 `models:` 下加一筆**
+
+（下面這個例子是 `noobai` profile 實際採用的條目；換 profile 就改另一個檔。）
 
 ```yaml
   - id: sdxl-controlnet-union
@@ -501,6 +532,25 @@ vast-comfy --env-file .env comfy verify-nodes --instance <ID> --session-id <SID>
 
 ---
 
+## 10b. Profile：一個工具、多個模型家族
+
+一個 profile 同時決定四件事：**模型清單**、**外掛清單**、**workflow**、**smoke suite**。
+
+```
+config/profiles/<name>.yaml        models + plugins（固定 revision/commit + sha256）
+workflows/<name>/api/*.json        API 格式 workflow（smoke runner 使用）
+workflows/<name>/gui/*.json        GUI 格式（在 ComfyUI 網頁 UI 開啟）
+assets/smoke/<name>/               smoke_cases.yaml + 內附輸入圖
+```
+
+- 預設 profile 在 `config/default.yaml` 的 `profile:` 指定（目前是 `noobai`）。
+- 每次命令都可以用 `--profile NAME` 臨時切換；它等同 `--set profile=NAME`，而明確的 `--set profile=X` 優先。
+- 現有兩個：`anima`（Anima 家族，分件式 UNET／CLIP／VAE，含 LLLite）與 `noobai`（SDXL 單檔 checkpoint，含 ControlNet-Union）。
+
+**刻意沒有 `config/models.yaml`**：清單按 profile 分檔，避免同一份資料維護兩次而漂移。
+
+`config validate` 會檢查目前 profile 的 model／plugin 清單**與** smoke 案例，所以換 profile 後最好先跑一次。
+
 ## 11. Smoke test 與 READY 判定
 
 ```bash
@@ -508,14 +558,26 @@ vast-comfy --env-file .env smoke run --instance <ID> --session-id <SID>
 vast-comfy --env-file .env smoke report --instance <ID> --session-id <SID> --run-id <RUN>
 ```
 
-四項必測案例（依序，全部必須**真正出新圖**）：
+案例清單**屬於 profile**，不再寫死在程式裡。每個 profile 的 `assets/smoke/<profile>/smoke_cases.yaml` 就是它的完整驗收 suite。
 
-| # | 案例 | 參數 |
+**`anima` profile（四項，依序）**
+
+| # | 案例 id | 參數 |
 | --- | --- | --- |
-| 1 | Anima-Base 文生圖 | 1024×1024、batch 1、30 steps、CFG 4 |
-| 2 | Base＋LLLite 混合線稿 | 同上，使用內附控制圖 |
-| 3 | Base＋LLLite 局部重繪 | 同上，使用內附圖片＋mask |
-| 4 | Anima-Turbo 文生圖 | 1024×1024、8 steps、CFG 1 |
+| 1 | `base_t2i` | 1024×1024、batch 1、30 steps、CFG 4 |
+| 2 | `lllite_lineart` | 同上，使用內附控制圖 |
+| 3 | `lllite_inpaint` | 同上，使用內附圖片＋mask |
+| 4 | `turbo_t2i` | 1024×1024、8 steps、CFG 1 |
+
+**`noobai` profile（三項，依序）**
+
+| # | 案例 id | 參數 |
+| --- | --- | --- |
+| 1 | `noobai_t2i` | 1024×1024、28 steps、CFG 5.5 |
+| 2 | `noobai_controlnet` | 1024×1024、ControlNet-Union SDXL 線稿控制 |
+| 3 | `noobai_nsfw` | 832×1216 直幅、negative 不含 `nsfw` token |
+
+`noobai_nsfw` 存在的理由：NoobAI 系 workflow 早期在 negative prompt 帶 `nsfw`，等於把這個 profile 存在的目的壓回去。這個案例宣告乾淨的 negative（透過 `overrides`），而 workflow 檔本身的預設值保留為**刻意的回歸護欄**——有人把 `nsfw` 加回去，這個案例就會抓到。
 
 驗收細節：
 
@@ -523,7 +585,8 @@ vast-comfy --env-file .env smoke report --instance <ID> --session-id <SID> --run
 - 固定 seed 尚未有安全的快取失效實作；`--fixed-seed`／`smoke.unique_seed_per_run: false` 明確失敗，不會悄悄改成另一種 seed 模式。
 - 每張圖必須：本次執行後才產生（mtime）、尺寸正確、可解碼、不是單一顏色。
 - GPU 必須是 CUDA 裝置、`nvidia-smi` 正常；必要節點（含外掛節點）必須存在。
-- 全部通過才回傳 `READY`；只跑部分案例為 `PARTIAL`（永遠不算 READY）；任一失敗為 `FAILED` 且**後續案例不執行**，明確停止。
+- **`READY` 的定義是「該 profile 設定的整套 suite 全部通過」**。只跑部分案例（`--cases` 子集）一律是 `PARTIAL`，永遠不會是 `READY`，即使它跑的每一案都成功。任一失敗為 `FAILED` 且**後續案例不執行**，明確停止。
+- 必要節點清單由**目前 profile 的 workflow** 推導：SDXL 需要 `CheckpointLoaderSimple`，Anima 需要 `UNETLoader`／`CLIPLoader`／`VAELoader`。寫死清單會對非 Anima 的 profile 誤報失敗。
 - 發現 ComfyUI 已有排隊／執行中的生成工作 → `E_COMFY_BUSY`：不清佇列、不插隊、不強制重啟。
 - OOM 或逾時不會偷偷降解析度、減 steps 或換模型。
 
@@ -557,7 +620,10 @@ vast-comfy --env-file .env download outputs --instance <ID> --session-id <SID> -
 
 - 本專案自己的管理程式：`src/vast_comfy/remote_agent/*.py`
 - 本專案工作流：`workflows/api/*.json`、`workflows/gui/*.json`
-- 小型非機密測試素材：`assets/smoke/*`（PNG／YAML／README）
+- 小型非機密測試素材：`assets/smoke/<profile>/*`（PNG／YAML／README）
+- 已 commit 的參考圖：`assets/reference/*`（可用 `comfy upload-image` 明確上傳）
+
+封包檔案是**從 profile 宣告的 smoke 案例推導**出來的明確白名單，不是目錄掃描——散落的檔案永遠不會被順便上傳。
 
 封裝採明確白名單＋sha256 manifest；部署到 `/workspace/.vast_comfy/pkg/<hash>/`，遠端驗證通過後才切換 `current`。`.env`、私鑰、`known_hosts`、`*.pem` 等一律拒絕打包（有測試覆蓋）。
 
@@ -569,7 +635,7 @@ vast-comfy --env-file .env download outputs --instance <ID> --session-id <SID> -
 ### Models / 私有 repo
 
 - 模型與外掛由 instance 直接下載，不經控制端轉傳。
-- **v1 不轉傳任何憑證到 instance**：若 `config/models.yaml` 的條目帶 `auth_env`（私密來源），流程會在付費或長時間安裝**之前**以 `E_APPROVAL_REQUIRED` 失敗並列出該些條目；請改用公開來源。
+- **v1 不轉傳任何憑證到 instance**：若 profile 清單的條目帶 `auth_env`（私密來源），流程會在付費或長時間安裝**之前**以 `E_APPROVAL_REQUIRED` 失敗並列出該些條目；請改用公開來源。
 - 來源只接受無憑證 HTTPS：拒絕 URL userinfo、query、fragment 及編碼繞路，不能把 token 塞進 URL 避開 `auth_env` 檢查。拒絕訊息不回顯原始敏感 URL；遠端安裝前還會重新驗證整批清單。
 - 未指定目的地前，本專案**不會**推送任何 repository、也不會擅自建立公開／私有 repo。
 
@@ -615,6 +681,7 @@ vast-comfy --env-file .env instance destroy --instance <ID> --session-id <SID> -
 | `E_INSTALL*` / `E_DEPLOY` | 安裝與部署問題（校驗／dirty／路徑） |
 | `E_COMFY_BUSY` / `E_COMFY_UNAVAILABLE` | 佇列忙碌／服務異常 |
 | `E_SMOKE_FAILED` | smoke 未達 READY |
+| `E_LORA_FAILED` / `E_HF_PUSH_FAILED` | LoRA 訓練線失敗／Hugging Face 上傳失敗 |
 | `E_INSTANCE_STATE` | instance 非 running／不存在 |
 | `E_UPSTREAM` / `E_NETWORK` | Vast.ai API／網路問題 |
 
@@ -662,7 +729,9 @@ vast-comfy --env-file .env instance destroy --instance <ID> --session-id <SID> -
 | 工作 | `vast-comfy jobs start` / `status` / `logs` / `wait` / `list` |
 | 安裝 | `vast-comfy install run` / `install verify` |
 | 服務 | `vast-comfy comfy status` / `health` / `restart` / `verify-nodes` / `gpu-check` / `logs` |
-| 驗收 | `vast-comfy smoke run` / `smoke report` |
+| 驗收 | `vast-comfy smoke run [--cases a,b]` / `smoke report` |
+| 上傳參考圖 | `vast-comfy comfy upload-image --file <PNG> [--name N]` |
+| LoRA | **尚無 CLI 子命令**；目前由 `vast_comfy.lora` 模組提供（Python API 見第 18 節） |
 | 下載 | `vast-comfy download report` / `images` / `outputs` |
 | 組合 | `vast-comfy flow prepare --instance <ID>` / `flow create-and-prepare --alias <A> --confirm-paid` |
 
@@ -699,33 +768,120 @@ Python API 與 CLI 共用同一套驗證、硬條件檢查與執行邏輯；失�
 
 ---
 
-## 17. 模型授權與驗收範圍
+## 17. 參考圖與實驗素材
+
+`assets/reference/` 放的是**拿來重現實驗的輸入**，不是產出：
+
+| 路徑 | 內容 |
+| --- | --- |
+| `assets/reference/noobai/doll_pose_reference.png` | Body Chan 球關節娃娃照，純姿勢參考（不是造型參考） |
+| `assets/reference/noobai/castle_room_reference.png` | 城堡臥室參考圖，裁成 3:4 直幅 |
+| `assets/reference/noobai/README.md` | 這些圖怎麼被消費、以及讓雙人構圖不塌的比例規則 |
+
+README 裡記錄的兩條硬規則，值得直接引用：
+
+1. **每個參考圖都要裁／補成跟輸出畫布相同的長寬比**，否則 ControlNet 會把人物拉寬、構圖崩掉。
+2. **DWPose 在娃娃上不管用**（person detector 只認真人），要用 `LineArtPreprocessor(coarse=enable)`；`coarse` 不開的話，娃娃的球關節環會被當成墨線畫回皮膚上。
+
+刻意**不進版控**：那次實驗的中間產物（44 張、約 29 MB 的 strength／denoise 掃描變體）。有價值的是參數結論，那不是靠留 12 張相似 PNG 保存的。同樣不進版控的還有 R18 產出圖。
+
+## 18. LoRA 訓練線
+
+推理驗收之外的第二條線：從少量圖訓練 concept LoRA。重點是**可重現**，不是畫質。
+
+```
+產 5 張圖（同概念、每張一個視角子句）
+  -> WD14 標註（Danbooru tags，正好是 NoobAI 的原生詞彙）
+  -> kohya sdxl_train_network.py
+  -> 載入 ComfyUI LoraLoader
+  -> 同 seed、同 prompt，開／關 LoRA 比對
+```
+
+| 路徑 | 角色 |
+| --- | --- |
+| `config/lora/<name>.yaml` | track 設定：底模、steps、dim/alpha、tag 門檻、HF repo |
+| `assets/lora/<name>/train/` | 訓練圖**與**其 WD14 caption（一起 commit） |
+| `assets/lora/<name>/verify/` | LoRA 開／關對照圖（權重真的有用的證據） |
+| `assets/lora/<name>/wd14_report.json` | tagger 原始分數 |
+| `src/vast_comfy/lora.py` | plan 建構、版本釘死、Hugging Face 上傳 |
+
+**版本釘死**（`lora.pins()`，測試斷言沒有任何一項是浮動版本）：
+
+| 元件 | pin |
+| --- | --- |
+| kohya sd-scripts | `11d8cedd0c67b93a10f8b2d75f43554f6f12c794` |
+| torch | `2.10.0+cu130`（torchvision `0.25.0+cu130`） |
+| transformers | `5.17.0` |
+| onnxruntime（tagger） | `1.31.0` |
+| WD14 tagger | `SmilingWolf/wd-v1-4-convnextv2-tagger-v2` @ `dbd4dbe553ee51feb3bc745b614fb762080e3912` |
+
+訓練 venv 與 ComfyUI 的 venv **分離**，用 `uv venv` + 釘死的 torch index 建；ComfyUI 自己的環境永遠不動。
+
+**驗證即計畫的一部分**：`lora.build_plan()` 把 tag → train → verify 的順序編進去，因為「檔案存在但輸出不變」是失敗的 run，不是成功的 run。驗證用固定 seed，量測平均絕對差與變化像素比例。
+
+**目前沒有 `vast-comfy lora ...` 子命令**——模組已就位並有測試覆蓋，但 CLI 還沒接上。現階段直接從 Python 呼叫：
+
+```python
+from pathlib import Path
+from vast_comfy import lora
+
+print(lora.pins())                                    # 釘死的版本
+spec = lora.load_spec(Path("config/lora/noobai_concept.yaml"))
+plan = lora.build_plan(spec, dataset_dir="/workspace/lora_smoke/img",
+                       work_dir="/workspace/lora_smoke", seed=4242)
+pub = lora.HfPublisher()                              # token 於呼叫時才讀 HF_TOKEN
+pub.push(repo_id="user/repo", local_path=Path("lora.safetensors"),
+         path_in_repo="noobai_concept.safetensors", dry_run=True)
+```
+
+**Hugging Face 上傳**走 `PUT https://huggingface.co/api/models/<repo>/upload/<path>`：
+
+- token 在**呼叫當下**才從 `HF_TOKEN` 讀，不存物件上，不會從 repr 或日誌漏出。
+- `--dry-run` 不需要 token，也不會送出任何位元組。
+- 缺 token 或非 2xx → `E_HF_PUSH_FAILED`，fail closed。
+- 整條路徑用 mock transport 測試，CI 不需 token 也不需網路。
+
+**已驗證的 smoke run（2026-10-21）**：5 張 1024×1024、WD14 每張 17–30 個 general tags、500 steps / 10 epochs / 7 分 29 秒、final loss ≈ 0.064、權重 114 MB（2958 tensors、57.0M params）、同 seed 前後平均絕對差 16.06/255、61.43% 像素變化 >8。
+
+**這次踩到的坑**（已寫進 `assets/lora/noobai_concept/README.md`）：
+
+- **SDXL 沒有 `clip_skip`**：`--clip_skip=2` 只會噴 warning 被忽略，別把 SD1.5 的習慣帶過來。
+- **`--cache_text_encoder_outputs` 與訓練 text encoder 互斥**：會直接 assert；要嘛拿掉該 flag，要嘛加 `--network_train_unet_only`。
+- 5 張圖本來就會 underfit。這裡成功只代表「鏈路通」，不代表「LoRA 好用」。
+
+權重檔（114 MB）**不進版控**，可用上面的釘死 stack 重建。
+
+## 19. 模型授權與驗收範圍
 
 - **Anima**（<https://huggingface.co/circlestone-labs/Anima>）：模型授權為 Circlestone Labs 的非商業授權（`circlestone-labs-non-commercial-license`）。本專案初始使用情境為**私人使用、自行生成圖片自行觀看**；收費託管模型服務需要另行確認授權。生成的圖片之商用條件請依模型頁面與其 LICENSE 為準。
 - **Anima-LLLite 權重**（<https://huggingface.co/kohya-ss/Anima-LLLite>）與外掛（<https://github.com/kohya-ss/ComfyUI-Anima-LLLite>）同源授權，請見其 LICENSE。
-- 驗收是**功能可用性**測試（能否實際出圖、節點與模型是否載入），不是美術品質保證，也不保證 LLLite 控制強度的主觀效果。
+- **NoobAI-XL v1.1**（<https://huggingface.co/Laxhar/noobai-XL-1.1>）：模型卡標示 not-for-all-audiences，訓練語料含 Danbooru 全量標籤（含 `nsfw`）。實際可用內容範圍請自行確認模型卡與授權。
+- **ControlNet-Union SDXL 1.0**（<https://huggingface.co/xinsir/controlnet-union-sdxl-1.0>）與 **comfyui_controlnet_aux**（<https://github.com/Fannovel16/comfyui_controlnet_aux>）各自授權請見其頁面。
+- 驗收是**功能可用性**測試（能否實際出圖、節點與模型是否載入），不是美術品質保證，也不保證 LLLite／ControlNet 控制強度的主觀效果。
 
----
-
-## 18. 驗證狀態
+## 20. 驗證狀態
 
 如實揭露（SPEC §17 真機驗收授權）：
+
+**已在真機完成**
+
+- **兩個 profile 都跑到 READY**：租用 RTX 3090（24 GB）、image `vastai/comfy:v0.41.0-cuda-13.2-py312`、ComfyUI 0.41.0／torch 2.10.0+cu130。`noobai`（3 案）與 `anima`（4 案）各自整套通過，含 ControlNet-Union 線稿控制、LLLite 線稿與局部重繪。
+- **LoRA 訓練線**在 3090 上端到端跑通（見第 18 節），含 WD14 標註與同 seed 開關驗證。
+- **參考圖實驗**：Body Chan 娃娃 → lineart → ControlNet 的雙人構圖流程，以及手部修復（裁前臂連手、放大約 4 倍、重繪、羽化貼回）。
 
 **已在控制端完成**
 
 - 單元測試＋模擬整合測試（本地 mock Vast.ai REST API／SSH／ComfyUI，**不接觸真實網路與 GPU**）：
   ```bash
-  .venv\Scripts\python.exe -m pytest
-  # 927 passed, 25 skipped
-  # skipped＝Linux-only 的 flock／FD 實測（15）＋Windows 權限受限的 symlink 測試（10）
+  .venv/bin/python -m pytest
+  # 994 passed, 2 skipped
   ```
-- 經四輪獨立審計後修正並補回歸：付費請求中斷／結果不明一律保留計費與查證資訊、`stop`／`destroy` 未知結果不解除操作鎖、推論逾時後背景 watcher 持續持鎖、跨執行緒操作排他、下載／模型路徑越界、URL 憑證繞過、部署清單內容雜湊比對（拒絕空白／重複／遭改寫清單）、scp 協定版本判定與路徑安全、安裝階段各自期限、release 結果不明分類、人工推論解除命令（`session resolve-inference`）、設定逾時實際生效等；逐項證據見 `AUDIT3_FIXES.md` 與 `AUDIT4_FIXES.md`。
+- 經四輪獨立審計後修正並補回歸：付費請求中斷／結果不明一律保留計費與查證資訊、`stop`／`destroy` 未知結果不解除操作鎖、推論逾時後背景 watcher 持續持鎖、跨執行緒操作排他、下載／模型路徑越界、URL 憑證繞過、部署清單內容雜湊比對、scp 協定版本判定與路徑安全、安裝階段各自期限、release 結果不明分類、人工推論解除命令（`session resolve-inference`）、設定逾時實際生效等；逐項證據見 `AUDIT3_FIXES.md` 與 `AUDIT4_FIXES.md`。
 - 覆蓋 SPEC §17 全 19 項：設定嚴格性、alias、硬條件逐項、整合報價與上限、付費授權、不可重試的建立、SSH 與主機指紋、鎖與心跳、job 逾時語意、下載校驗、白名單部署、smoke 判定（舊圖／單色／尺寸／缺節點／busy）、JSON／exit code 契約。
 - 測試細節與範圍見 [`tests/README.md`](./tests/README.md)。
 
 **尚未完成（不宣稱已可用）**
 
-- 遠端 `flock` 競態與工作存活行為的**實機**驗證：測試已寫好並標記 `linux_only`（於 Linux 執行時自動啟用）；目前只在 Windows 上跳過。
-- image 候選 `vastai/comfy:v0.40.0-cuda-12.9-py312`（amd64 digest `sha256:63ece7…`）**尚未**經本專案真機相容性驗證；實作以固定 tag／digest 為準。
-- 真機付費驗收（完整 smoke suite 於真實 instance 出圖）需另外取得你的明確同意（GPU alias、報價、測試時間）。
-- 在完成真機驗收之前，README 不會宣稱「已保證可用」。
+- 遠端 `flock` 競態與工作存活行為的**實機**競態驗證：測試已寫好並標記 `linux_only`；`destroy`／`stop`／`direct_only` 路徑已在實機走過，但併發衝突場景仍是模擬覆蓋。
+- image tag 不一致：repo 釘 `vastai/comfy:v0.40.0-cuda-12.9-py312`，實機驗收跑的是 `v0.41.0-cuda-13.2-py312`。這是**已知落差**，尚未決定要把 repo 更新到 0.41.0 還是重驗 0.40.0。
+- `ssh.strategy` 尚未固化成 `direct_only`；實務上 proxy 端點多次失效，每次都得在命令列覆寫。

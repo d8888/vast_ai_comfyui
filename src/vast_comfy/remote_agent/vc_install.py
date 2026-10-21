@@ -255,7 +255,86 @@ def _install_plugin(entry: dict) -> dict:
             id=plugin_id,
             path=str(dest),
         )
-    return {"id": plugin_id, "action": "installed", "path": str(dest), "commit": commit}
+    result = {"id": plugin_id, "action": "installed", "path": str(dest), "commit": commit}
+    if entry.get("requirements"):
+        result["requirements"] = _install_requirements(plugin_id, dest, entry["requirements"])
+    return result
+
+
+# Packages that must never be touched by a plugin's requirements: replacing the
+# image's CUDA-matched torch build breaks every other workflow on the instance.
+_PROTECTED_PACKAGES = ("torch", "torchvision", "torchaudio", "xformers", "pytorch")
+_REQ_NAME = re.compile(r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)")
+
+
+def _install_requirements(plugin_id: str, dest: Path, req_rel: str) -> dict:
+    """Install a plugin's requirements without letting it rewrite torch.
+
+    Many ComfyUI plugins pin torch/CUDA versions that would replace the image's
+    working build and break every existing workflow. Those lines are dropped and
+    reported; everything else installs normally, with the current torch pinned
+    as a constraint so a transitive dependency cannot upgrade it either.
+    """
+    req_path = C.confined_path(dest, req_rel)
+    if not req_path.is_file():
+        C.fail(
+            "E_INSTALL",
+            f"Plugin {plugin_id} declares requirements {req_rel!r} but no such file was checked out.",
+            exit_code=1,
+            id=plugin_id,
+            path=str(req_path),
+        )
+    keep, skipped = [], []
+    for raw in req_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or line.startswith("-"):
+            continue
+        match = _REQ_NAME.match(line)
+        name = (match.group(1) if match else "").lower().replace("_", "-")
+        if any(name == p or name.startswith(p + "-") for p in _PROTECTED_PACKAGES):
+            skipped.append(line)
+            continue
+        keep.append(line)
+
+    python = str(os.environ.get("VAST_COMFY_VENV_PYTHON") or "/venv/main/bin/python")
+    if not keep:
+        return {"action": "skipped", "installed": [], "skipped": skipped, "reason": "no non-protected requirements"}
+
+    tmp_dir = C.RUNTIME_DIR / "tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    filtered = tmp_dir / f"req-{plugin_id}-{uuid.uuid4().hex}.txt"
+    filtered.write_text("\n".join(keep) + "\n", encoding="utf-8")
+    argv = [python, "-m", "pip", "install", "--no-input", "--disable-pip-version-check", "-r", str(filtered)]
+    constraints = None
+    try:
+        version = subprocess.run(
+            [python, "-m", "pip", "show", "torch"], capture_output=True, text=True,
+            **C.child_process_options(),
+        )
+        constraints = None
+        if version.returncode == 0:
+            found = re.search(r"^Version:\s*(\S+)", version.stdout, re.MULTILINE)
+            if found:
+                constraints = tmp_dir / f"con-{plugin_id}-{uuid.uuid4().hex}.txt"
+                constraints.write_text(f"torch=={found.group(1)}\n", encoding="utf-8")
+                argv += ["-c", str(constraints)]
+        rc = _run_checked(argv)
+        if rc != 0:
+            # The checkout is valid but unusable without its dependencies; say so
+            # instead of reporting a plugin that will fail to import at runtime.
+            C.fail(
+                "E_INSTALL",
+                f"pip install failed for plugin {plugin_id} (rc={rc}); the checkout is kept for inspection.",
+                exit_code=1,
+                id=plugin_id,
+                path=str(dest),
+                skipped_requirements=skipped,
+            )
+    finally:
+        filtered.unlink(missing_ok=True)
+        if constraints is not None:
+            constraints.unlink(missing_ok=True)
+    return {"action": "installed", "installed": keep, "skipped": skipped}
 
 
 def _validate_model_entry(entry: dict) -> None:
@@ -285,7 +364,7 @@ def _validate_model_entry(entry: dict) -> None:
 
 def _validate_plugin_entry(entry: dict) -> None:
     try:
-        if not isinstance(entry, dict) or set(entry) - {"id", "repo_url", "commit", "dest", "required_nodes"}:
+        if not isinstance(entry, dict) or set(entry) - {"id", "repo_url", "commit", "dest", "required_nodes", "requirements"}:
             raise ValueError("invalid plugin fields")
         C.validate_identifier(entry["id"], label="plugin id")
         C.confined_path(C.COMFY_DIR, C.validate_plugin_relpath(entry["dest"]))
@@ -295,6 +374,11 @@ def _validate_plugin_entry(entry: dict) -> None:
         nodes = entry.get("required_nodes", [])
         if not isinstance(nodes, list) or any(not isinstance(n, str) or not n for n in nodes):
             raise ValueError("invalid required_nodes")
+        req = entry.get("requirements")
+        if req is not None:
+            if (not isinstance(req, str) or not req.endswith(".txt") or req.startswith("/")
+                    or ".." in req.split("/") or "\\" in req):
+                raise ValueError("invalid requirements path")
     except (KeyError, TypeError, ValueError):
         C.fail("E_CONFIG", "Invalid or unsafe plugin manifest entry; no checkout was started.")
 

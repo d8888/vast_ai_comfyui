@@ -702,6 +702,16 @@ def cmd_comfy_logs(ctx: Ctx, args) -> dict:
     return comfy.logs(runner, ctx.cfg, session_id, tail=args.tail)
 
 
+def cmd_comfy_upload_image(ctx: Ctx, args) -> dict:
+    from . import comfy
+
+    runner, session_id = _session_guard(ctx, args.instance, args.session_id)
+    result = comfy.upload_image(
+        runner, ctx.cfg, session_id, local_path=args.file, name=args.name
+    )
+    return result
+
+
 def cmd_smoke_run(ctx: Ctx, args) -> dict:
     from . import smoke
 
@@ -1085,6 +1095,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--session-id", default=None)
     p.add_argument("--tail", type=int, default=200)
     p.set_defaults(func=cmd_comfy_logs)
+    p = g.sub.add_parser(
+        "upload-image", help="copy a local PNG into ComfyUI's input directory", parents=[common]
+    )
+    p.add_argument("--instance", required=True)
+    p.add_argument("--session-id", default=None)
+    p.add_argument("--file", required=True, help="local .png path")
+    p.add_argument("--name", default=None, help="name inside ComfyUI input (default: basename)")
+    p.set_defaults(func=cmd_comfy_upload_image)
 
     # smoke
     g = add_group("smoke", "smoke tests & reports")

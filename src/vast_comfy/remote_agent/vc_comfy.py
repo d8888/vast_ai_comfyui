@@ -9,7 +9,10 @@ force-restarted over pending work.
 from __future__ import annotations
 
 import argparse
+import errno
 import json
+import os
+import shutil
 import subprocess
 import sys
 import time
@@ -255,6 +258,68 @@ def cmd_logs(args) -> None:
     C.emit(payload)
 
 
+def cmd_upload_image(args) -> None:
+    """Place a controller-supplied image where ComfyUI's LoadImage can read it.
+
+    The file is written to a staging directory inside the runtime dir first and
+    then hard-linked into ComfyUI's input dir, so a partial transfer can never be
+    observed by a workflow, and an existing different file is never overwritten.
+    """
+    C.ensure_owns(args.session_id)
+    name = args.name
+    try:
+        C.validate_identifier(name, "image name")
+    except ValueError:
+        C.fail("E_USAGE", "image name must be a single safe filename (no directories).")
+    if not name.lower().endswith(".png"):
+        C.fail("E_USAGE", "only PNG uploads are accepted; convert the source first.")
+
+    staged = Path(args.staged_path)
+    if not staged.is_file():
+        C.fail("E_USAGE", f"staged upload not found: {staged}", exit_code=1)
+    actual = C.sha256_file(staged)
+    if actual != str(args.sha256).lower():
+        C.fail(
+            "E_USAGE",
+            "Uploaded file does not match the declared checksum; it was not installed.",
+            exit_code=1,
+            expected_sha256=str(args.sha256).lower(),
+            actual_sha256=actual,
+        )
+
+    input_dir = C.confined_path(C.COMFY_DIR, "input")
+    input_dir.mkdir(parents=True, exist_ok=True)
+    dest = C.confined_path(input_dir, name)
+    if dest.exists() or dest.is_symlink():
+        if dest.is_file() and not dest.is_symlink() and C.sha256_file(dest) == actual:
+            C.emit({"ok": True, "name": name, "action": "already_present", "sha256": actual,
+                    "path": str(dest)})
+            return
+        C.fail(
+            "E_UPLOAD_CONFLICT",
+            "a different file already exists at that name; it was NOT overwritten",
+            exit_code=1,
+            name=name,
+            path=str(dest),
+            hint="Upload under a different --name, or remove the existing file yourself.",
+        )
+    try:
+        os.link(staged, dest, follow_symlinks=False)
+    except OSError as exc:
+        if exc.errno != errno.EXDEV:
+            raise
+        try:
+            with dest.open("xb") as target, staged.open("rb") as source:
+                shutil.copyfileobj(source, target)
+        except FileExistsError:
+            C.fail("E_UPLOAD_CONFLICT", "file appeared during copy; not overwritten",
+                   exit_code=1, name=name, path=str(dest))
+    if C.sha256_file(dest) != actual:
+        dest.unlink(missing_ok=True)
+        C.fail("E_UPLOAD", "copied file failed checksum verification", exit_code=1, name=name)
+    C.emit({"ok": True, "name": name, "action": "installed", "sha256": actual, "path": str(dest)})
+
+
 def add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--comfy-url", default="http://localhost:18188")
     parser.add_argument("--service", default="comfyui")
@@ -301,6 +366,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--tail", type=int, default=200)
     add_common(p)
     p.set_defaults(func=cmd_logs)
+
+    p = sub.add_parser("upload-image")
+    p.add_argument("--session-id", required=True)
+    p.add_argument("--name", required=True)
+    p.add_argument("--staged-path", required=True)
+    p.add_argument("--sha256", required=True)
+    p.set_defaults(func=cmd_upload_image)
 
     return parser
 

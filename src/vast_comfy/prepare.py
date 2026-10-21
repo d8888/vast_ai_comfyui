@@ -186,7 +186,7 @@ def build_install_manifest() -> dict:
 
     plugins = []
     for entry in doc["plugins"]:
-        _entry_fields(entry, {"id", "purpose", "repo_url", "commit", "dest", "required_nodes"}, "plugin")
+        _entry_fields(entry, {"id", "purpose", "repo_url", "commit", "dest", "required_nodes", "requirements"}, "plugin")
         p_id = entry.get("id")
         repo_url, commit, dest = entry.get("repo_url"), entry.get("commit"), entry.get("dest")
         if not p_id or not repo_url or not commit or not dest:
@@ -205,6 +205,14 @@ def build_install_manifest() -> dict:
         nodes = entry.get("required_nodes", [])
         if not isinstance(nodes, list) or any(not isinstance(n, str) or not n for n in nodes):
             raise ConfigError(f"plugin {p_id}: required_nodes must be a list of node names")
+        requirements = entry.get("requirements")
+        if requirements is not None:
+            # A path inside the checked-out plugin, never an absolute or
+            # traversing one: the remote side re-validates this as well.
+            if (not isinstance(requirements, str) or not requirements.endswith(".txt")
+                    or requirements.startswith("/") or ".." in requirements.split("/")
+                    or "\\" in requirements):
+                raise ConfigError(f"plugin {p_id}: requirements must be a relative .txt path")
         plugins.append(
             {
                 "id": p_id,
@@ -212,6 +220,7 @@ def build_install_manifest() -> dict:
                 "commit": str(commit),
                 "dest": str(dest),
                 "required_nodes": list(entry.get("required_nodes") or []),
+                **({"requirements": requirements} if requirements else {}),
             }
         )
     return {"models": models, "plugins": plugins}

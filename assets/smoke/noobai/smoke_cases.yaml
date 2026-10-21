@@ -1,0 +1,41 @@
+schema_version: 1
+# NoobAI-XL (SDXL) smoke suite.
+#
+# SDXL loads through a single CheckpointLoaderSimple, so these cases declare
+# `family: checkpoint`. ControlNet uses the core ControlNetApplyAdvanced nodes
+# with the xinsir union weights, no custom-node package required.
+
+cases:
+  - id: noobai_t2i
+    title: "NoobAI-XL text to image"
+    workflow: noobai_t2i.api.json
+    timeout_minutes: 15
+    family: checkpoint
+    control: none
+    expect_model:
+      checkpoint: NoobAI-XL-v1.1.safetensors
+    expect_sampler: {steps: 28, cfg: 5.5}
+    inputs: []
+    overrides:
+      "5": {seed: "$run_seed"}
+    expect:
+      width: 1024
+      height: 1024
+
+  - id: noobai_controlnet
+    title: "NoobAI-XL + ControlNet-Union SDXL line-art control"
+    workflow: noobai_controlnet.api.json
+    timeout_minutes: 15
+    family: checkpoint
+    control: controlnet
+    expect_model:
+      checkpoint: NoobAI-XL-v1.1.safetensors
+      controlnet: controlnet-union-sdxl-1.0.safetensors
+    expect_sampler: {steps: 28, cfg: 5.5}
+    inputs:
+      - vast_comfy_smoke_control.png
+    overrides:
+      "8": {seed: "$run_seed"}
+    expect:
+      width: 1024
+      height: 1024

@@ -5,6 +5,11 @@
 
 version: 1
 
+# Active model profile. Names a directory under config/profiles/ (models +
+# plugins) and assets/smoke/ (smoke cases + input images), plus
+# workflows/<profile>/{api,gui}/. Override per command with --profile.
+profile: noobai
+
 vast:
   api_base_url: "https://console.vast.ai"
   api_key_env: "VAST_API_KEY"

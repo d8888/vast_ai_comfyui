@@ -30,10 +30,10 @@ def test_package_files_are_the_expected_whitelist():
     assert len(files) == len(set(rels)), "duplicate remote paths in the package"
     assert "remote/vc_common.py" in rels
     assert "remote/vc_smoke.py" in rels
-    assert sum(1 for rel in rels if rel.startswith("workflows/api/")) == 4
-    assert sum(1 for rel in rels if rel.startswith("workflows/gui/")) == 4
-    assert "assets/smoke/vast_comfy_smoke_control.png" in rels
-    assert "assets/smoke/smoke_cases.yaml" in rels
+    assert sum(1 for rel in rels if rel.startswith("workflows/anima/api/")) == 4
+    assert sum(1 for rel in rels if rel.startswith("workflows/anima/gui/")) == 4
+    assert "assets/smoke/anima/vast_comfy_smoke_control.png" in rels
+    assert "assets/smoke/anima/smoke_cases.yaml" in rels
     for path, rel in files:
         assert path.is_file(), rel
         assert "\\" not in rel
@@ -52,7 +52,7 @@ def test_package_files_never_include_secret_like_files():
 def test_package_files_does_not_walk_user_directories():
     # The whitelist is derived from explicit roots only; a stray file in an
     # unlisted directory (e.g. a model cache) can never enter the package.
-    allowed_prefixes = ("remote/", "workflows/api/", "workflows/gui/", "assets/smoke/")
+    allowed_prefixes = ("remote/", "workflows/", "assets/smoke/")
     for _, rel in remote.package_files():
         assert rel.startswith(allowed_prefixes), rel
 

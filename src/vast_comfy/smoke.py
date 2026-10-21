@@ -9,6 +9,7 @@ from . import jobs, remote
 from .config import Config
 from .errors import E_JOB_FAILED, E_SMOKE_FAILED, VastComfyError
 from .prepare import b64_json, build_models_payload, build_install_manifest, smoke_request
+from .paths import resolve_profile
 from .safety import validate_identifier
 from .ssh import SSHRunner
 
@@ -28,6 +29,7 @@ def run_smoke(
     on_poll: Any = None,
 ) -> dict:
     """Run the smoke suite as a remote background job and return its summary."""
+    profile = resolve_profile()
     actual_run_id, seed, cases_doc = smoke_request(cfg, run_id=run_id, base_seed=base_seed, cases=cases)
     models_payload = build_models_payload(build_install_manifest()) if models else []
 
@@ -38,9 +40,9 @@ def run_smoke(
         "--cases-b64",
         b64_json(cases_doc),
         "--workflows-dir",
-        f"{remote.current_link(cfg)}/workflows/api",
+        f"{remote.current_link(cfg)}/workflows/{profile}/api",
         "--assets-dir",
-        f"{remote.current_link(cfg)}/assets/smoke",
+        f"{remote.current_link(cfg)}/assets/smoke/{profile}",
         "--run-id",
         actual_run_id,
         "--base-seed",

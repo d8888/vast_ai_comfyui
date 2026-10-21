@@ -1,0 +1,39 @@
+# NoobAI-XL (SDXL) profile — default profile.
+#
+# Pinned revisions + sha256 for every file. Models are downloaded DIRECTLY by
+# the instance (never relayed through the control machine).
+#
+# NoobAI-XL is a single-file SDXL checkpoint: CLIP and VAE are baked in, so it
+# loads through ComfyUI's `Load Checkpoint` node and needs none of Anima's
+# separate UNET/text-encoder/VAE files. That is why this profile is far smaller
+# than the Anima one and why its smoke suite uses different node types.
+
+schema_version: 1
+
+models:
+  - id: noobai-xl-v1.1
+    purpose: "NoobAI-XL v1.1 (eps): SDXL anime checkpoint with Danbooru tags, artist styles and character coverage"
+    source:
+      type: huggingface
+      repo: Laxhar/noobai-XL-1.1
+      revision: 814a274af2b8097c0828819d561ec74c7d0c6cea
+      path: NoobAI-XL-v1.1.safetensors
+    dest: checkpoints/NoobAI-XL-v1.1.safetensors
+    sha256: 6681e8e4b134c81f16533acedb0d406d7e5e366e1624b4105178c64d00b05d51
+    size_bytes: 7105349958
+
+  - id: controlnet-union-sdxl-1.0
+    purpose: "xinsir ControlNet-Union SDXL 1.0: one weight set covering canny/depth/pose/lineart control"
+    source:
+      type: huggingface
+      repo: xinsir/controlnet-union-sdxl-1.0
+      revision: 801a4a3fa3d4c936f4feea95b98607bc6726f80c
+      path: diffusion_pytorch_model.safetensors
+    dest: controlnet/controlnet-union-sdxl-1.0.safetensors
+    sha256: a9e13fd61f3193887791c8a0dd07a07202174dc47d5ddaea94ea1344f07c7467
+    size_bytes: 2512030408
+
+# ControlNet loading and application are core ComfyUI nodes
+# (ControlNetLoader / ControlNetApplyAdvanced), so this profile needs no
+# custom node packages.
+plugins: []

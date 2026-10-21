@@ -7,11 +7,17 @@ integration point is replaced by a local mock (see ``tests/mocks/``).
 from __future__ import annotations
 
 import importlib
+import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+
+# Must run before any test module is imported: several modules build the deploy
+# package at import time, and that package is profile-dependent. Set here rather
+# than only in a fixture so import-time evaluation sees the same profile.
+os.environ.setdefault("VAST_COMFY_PROFILE", "anima")
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 REMOTE_AGENT_DIR = REPO_ROOT / "src" / "vast_comfy" / "remote_agent"
@@ -25,9 +31,40 @@ def ensure_remote_agent_on_path() -> None:
         sys.path.insert(0, str(REMOTE_AGENT_DIR))
 
 
+@pytest.fixture(autouse=True)
+def _default_test_profile(monkeypatch):
+    """Pin the suite-wide default to ``anima``.
+
+    Production defaults to ``noobai``, but the bulk of the existing tests assert
+    the Anima suite (LLLite cases, Qwen encoders, the 19-file package). Tests
+    that exercise the NoobAI profile request ``noobai_profile`` explicitly,
+    which runs after this fixture and therefore wins.
+    """
+    monkeypatch.setenv("VAST_COMFY_PROFILE", "anima")
+    return "anima"
+
+
 @pytest.fixture(scope="session")
 def repo_root() -> Path:
     return REPO_ROOT
+
+
+@pytest.fixture()
+def anima_profile(monkeypatch):
+    """Pin the legacy Anima expectations to the ``anima`` profile.
+
+    Profile selection lives in config/env, so tests that assert the Anima suite
+    (LLLite cases, Qwen encoders) must say which profile they mean instead of
+    relying on whatever the default happens to be.
+    """
+    monkeypatch.setenv("VAST_COMFY_PROFILE", "anima")
+    return "anima"
+
+
+@pytest.fixture()
+def noobai_profile(monkeypatch):
+    monkeypatch.setenv("VAST_COMFY_PROFILE", "noobai")
+    return "noobai"
 
 
 @pytest.fixture()

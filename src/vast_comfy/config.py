@@ -30,6 +30,7 @@ from .paths import config_dir, find_repo_root
 
 DEFAULTS: dict[str, Any] = {
     "version": 1,
+    "profile": "noobai",
     "vast": {
         "api_base_url": "https://console.vast.ai",
         "api_key_env": "VAST_API_KEY",
@@ -115,6 +116,7 @@ DEFAULTS: dict[str, Any] = {
 }
 
 _ALIAS_RE = re.compile(r"^[a-z0-9][a-z0-9_]*$")
+_PROFILE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 
 
 # ---------------------------------------------------------------------------
@@ -270,6 +272,13 @@ def _require_number(data: dict[str, Any], path: str, *, minimum: float | None = 
 def _validate_semantics(data: dict[str, Any]) -> None:
     if data.get("version") != 1:
         raise ConfigError(f"Unsupported config version: {data.get('version')!r} (expected 1)")
+
+    profile = data.get("profile")
+    if not isinstance(profile, str) or not _PROFILE_RE.match(profile):
+        raise ConfigError(
+            f"profile must match {_PROFILE_RE.pattern!r} (got {profile!r}); "
+            "a profile names a directory under config/profiles and assets/smoke"
+        )
 
     vast = data["vast"]
     if not str(vast["api_base_url"]).startswith(("http://", "https://")):
@@ -479,9 +488,17 @@ def load_config(
     if config_path:
         yaml_data = _load_yaml(Path(config_path))
         data = _deep_merge(data, yaml_data)
-    if set_overrides:
+    overrides = dict(set_overrides or {})
+    # Environment override: defaults -> YAML -> VAST_COMFY_PROFILE -> CLI.
+    # The env var exists so tooling (and the test suite) can select a profile
+    # without rewriting a file; an explicit --profile/--set still wins.
+    if "profile" not in overrides:
+        env_profile = os.environ.get("VAST_COMFY_PROFILE")
+        if env_profile:
+            overrides["profile"] = env_profile
+    if overrides:
         # Apply CLI overrides on top of defaults->yaml, then re-validate everything.
-        for dotted, value in set_overrides.items():
+        for dotted, value in overrides.items():
             set_dotted(data, dotted, value)
     _validate_types(DEFAULTS, {k: v for k, v in data.items() if k != "version"} | {"version": data["version"]}, "")
     _validate_semantics(data)

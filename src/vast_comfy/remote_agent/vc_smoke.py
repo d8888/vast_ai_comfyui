@@ -41,9 +41,9 @@ except ImportError:  # pragma: no cover - exercised only on broken images
     Image = None
 
 SMOKE_CLIENT_ID = "vast-comfy-smoke"
-REQUIRED_CASE_IDS = ("base_t2i", "lllite_lineart", "lllite_inpaint", "turbo_t2i")
 MAX_SEED = (1 << 64) - 1
 LLLITE_NODE = "AnimaLLLiteApply_sdscripts"
+CONTROL_MODES = ("none", "lllite", "lllite_inpaint", "controlnet")
 
 
 class CaseFailure(Exception):
@@ -114,13 +114,14 @@ def validate_cases(cases) -> list[dict]:
         raise CaseFailure("SMOKE_CONFIG", "smoke cases must be a non-empty list")
     seen = set()
     required = {"id", "workflow", "timeout_minutes", "overrides", "expect", "inputs"}
+    optional = {"title", "family", "control", "expect_model", "expect_sampler"}
     for case in cases:
         if not isinstance(case, dict):
             raise CaseFailure("SMOKE_CONFIG", "smoke case entry must be a mapping")
-        if not required <= case.keys() or case.keys() - required - {"title"}:
+        if not required <= case.keys() or case.keys() - required - optional:
             raise CaseFailure("SMOKE_CONFIG", "smoke case has missing or unknown fields")
         case_id = case["id"]
-        if not isinstance(case_id, str) or case_id not in REQUIRED_CASE_IDS or case_id in seen:
+        if not isinstance(case_id, str) or not case_id or case_id in seen:
             raise CaseFailure("SMOKE_CONFIG", f"unknown or duplicate smoke case id: {case_id!r}")
         seen.add(case_id)
         if "title" in case and not isinstance(case["title"], str):
@@ -160,8 +161,8 @@ def validate_cases(cases) -> list[dict]:
                     type(value) is int and 0 <= value <= MAX_SEED
                 ):
                     raise CaseFailure("SMOKE_CONFIG", "seed must be $run_seed or a uint64")
-    if len(cases) == 4 and tuple(case["id"] for case in cases) != REQUIRED_CASE_IDS:
-        raise CaseFailure("SMOKE_CONFIG", "the full smoke suite must use the required case order")
+    if len(cases) == 4 and len({c["id"] for c in cases}) != 4:
+        raise CaseFailure("SMOKE_CONFIG", "smoke case ids must be unique")
     return cases
 
 
@@ -222,8 +223,15 @@ def build_prompt(
 def validate_graph(case: dict, prompt: dict, seed: int, assets_dir: Path) -> dict:
     """Trace the *active* save/sampler/model path, not names or dangling nodes.
 
-    v1 accepts the shipped UNET/CLIP/VAE/KSampler graph and its explicit input
-    overrides, not arbitrary equivalent custom-node implementations.
+    Two model families are supported because the shipped profiles differ:
+
+    * ``unet``       - separate UNETLoader + CLIPLoader + VAELoader (Anima)
+    * ``checkpoint`` - a single CheckpointLoaderSimple (SDXL / NoobAI)
+
+    and three control paths: ``none``, the AnimaLLLite plugin nodes, and the core
+    ControlNetApplyAdvanced nodes. Which one applies, and which model files must
+    appear, is declared by the case itself (``family``/``control``/
+    ``expect_model``/``expect_sampler``), so no specific model is baked in here.
     """
     def reject(message: str) -> None:
         raise CaseFailure("SMOKE_WORKFLOW", f"{case['id']}: {message}")
@@ -244,22 +252,63 @@ def validate_graph(case: dict, prompt: dict, seed: int, assets_dir: Path) -> dic
             reject(f"{key} must connect to {class_type} output {slot}")
         return value[0], prompt[value[0]]["inputs"]
 
+    family = case.get("family", "unet")
+    control = case.get("control", "none")
+    if family not in ("unet", "checkpoint"):
+        reject(f"unknown model family {family!r}")
+    if control not in CONTROL_MODES:
+        reject(f"unknown control mode {control!r}")
+
     output_id, output = only("SaveImage")
     _, decode = linked(output["inputs"], "images", "VAEDecode")
     sampler_id, _ = only("KSampler")
     connected_sampler, sampler = linked(decode, "samples", "KSampler")
     if connected_sampler != sampler_id:
         reject("SaveImage must use the required sampler")
-    _, vae = linked(decode, "vae", "VAELoader")
-    if vae.get("vae_name") != "qwen_image_vae.safetensors":
-        reject("requires the Qwen Image VAE")
-    for key in ("positive", "negative"):
-        _, conditioning = linked(sampler, key, "CLIPTextEncode")
-        _, clip = linked(conditioning, "clip", "CLIPLoader")
-        if clip.get("clip_name") != "qwen_3_06b_base.safetensors" or clip.get("device") == "cpu":
-            reject("requires the Qwen3 encoder on the default/GPU device")
-        if not isinstance(conditioning.get("text"), str) or not conditioning["text"].strip():
-            reject(f"{key} text must be non-empty")
+
+    # ---- model source differs per family ----------------------------
+    if family == "unet":
+        _, vae = linked(decode, "vae", "VAELoader")
+        vae_name = vae.get("vae_name")
+        clip_name = None
+        # With ControlNet the conditioning reaches the sampler through the apply
+        # node, so the direct CLIPTextEncode links are resolved in that section.
+        if control != "controlnet":
+            for key in ("positive", "negative"):
+                _, conditioning = linked(sampler, key, "CLIPTextEncode")
+                _, clip = linked(conditioning, "clip", "CLIPLoader")
+                if clip.get("device") == "cpu":
+                    reject("text encoder must not be pinned to CPU")
+                clip_name = clip.get("clip_name")
+                if not isinstance(conditioning.get("text"), str) or not conditioning["text"].strip():
+                    reject(f"{key} text must be non-empty")
+        # LLLite patches the model, so the sampler links to the plugin node
+        # rather than the loader; that path is resolved in the control section.
+        if control in ("lllite", "lllite_inpaint"):
+            model, model_field = None, "unet_name"
+        else:
+            _, model = linked(sampler, "model", "UNETLoader")
+            model_field = "unet_name"
+    else:
+        ckpt_id, ckpt = only("CheckpointLoaderSimple")
+        ckpt_inputs = ckpt["inputs"]
+        vae_id, _ = linked(decode, "vae", "CheckpointLoaderSimple", 2)
+        # linked() returns the node's inputs, only() the node itself, so identity
+        # must be compared by node id rather than by object.
+        if vae_id != ckpt_id:
+            reject("VAE must come from the same checkpoint")
+        vae_name = ckpt_inputs.get("ckpt_name")
+        clip_name = None
+        if control != "controlnet":
+            for key in ("positive", "negative"):
+                _, conditioning = linked(sampler, key, "CLIPTextEncode")
+                source_id, _ = linked(conditioning, "clip", "CheckpointLoaderSimple", 1)
+                if source_id != ckpt_id:
+                    reject("text encoders must come from the same checkpoint")
+                if not isinstance(conditioning.get("text"), str) or not conditioning["text"].strip():
+                    reject(f"{key} text must be non-empty")
+        model, model_field = ckpt_inputs, "ckpt_name"
+
     latent_id, latent = linked(sampler, "latent_image", "EmptyLatentImage")
     for key in ("width", "height"):
         if not _positive_int(latent.get(key)) or latent[key] != case["expect"][key]:
@@ -270,26 +319,31 @@ def validate_graph(case: dict, prompt: dict, seed: int, assets_dir: Path) -> dic
         reject("steps/CFG must be positive finite parameters")
     if not _positive_number(sampler.get("denoise")) or sampler["denoise"] > 1:
         reject("denoise must be in (0, 1]")
-    turbo = case["id"] == "turbo_t2i"
-    defaults = {"steps": 8 if turbo else 30, "cfg": 1.0 if turbo else 4.0, "denoise": 1.0}
+    # Sampling defaults are declared by the case, not inferred from its id.
+    declared = case.get("expect_sampler") or {}
+    if not isinstance(declared, dict) or "steps" not in declared or "cfg" not in declared:
+        reject("case must declare expect_sampler.steps and expect_sampler.cfg")
+    defaults = {"steps": declared["steps"], "cfg": declared["cfg"], "denoise": 1.0}
     for key, default in defaults.items():
         if sampler[key] != case["overrides"].get(sampler_id, {}).get(key, default):
-            reject(f"{key} differs from the default without an explicit override")
+            reject(f"{key} differs from the declared default without an explicit override")
     if latent["batch_size"] != case["overrides"].get(latent_id, {}).get("batch_size", 1):
         reject("batch_size differs from the default without an explicit override")
     if type(sampler.get("seed")) is not int or sampler["seed"] != seed:
         raise CaseFailure("SMOKE_CACHE", "the active KSampler must use $run_seed, not a fixed seed")
 
-    is_lllite = case["id"] in ("lllite_lineart", "lllite_inpaint")
-    if is_lllite:
+    # ---- control path ------------------------------------------------
+    # Initialised here: only the ControlNet branch fills it, and the summary is
+    # returned for every case.
+    control_net_name = None
+    if control in ("lllite", "lllite_inpaint"):
         plugin_id, _ = only(LLLITE_NODE)
         connected_plugin, apply = linked(sampler, "model", LLLITE_NODE)
         if plugin_id != connected_plugin:
             reject("the sampler must use the LLLite-patched model")
-        weight = (
-            "anima-lllite-inpainting-v2.safetensors" if case["id"] == "lllite_inpaint"
-            else "anima-lllite-any-test-like-v2.safetensors"
-        )
+        weight = (case.get("expect_model") or {}).get("lllite")
+        if not isinstance(weight, str) or not weight:
+            reject("LLLite cases must declare expect_model.lllite")
         if apply.get("lllite_name") != weight:
             reject(f"requires LLLite weight {weight}")
         if not _positive_number(apply.get("strength")):
@@ -309,7 +363,7 @@ def validate_graph(case: dict, prompt: dict, seed: int, assets_dir: Path) -> dic
                 img.load()
                 if img.format != "PNG":
                     reject("the bundled input must be PNG")
-                if case["id"] == "lllite_inpaint":
+                if control == "lllite_inpaint":
                     mask_id, _ = linked(apply, "mask", "LoadImage", 1)
                     if mask_id != image_id or "A" not in img.getbands():
                         reject("inpainting mask must use the source image's alpha-mask output")
@@ -318,21 +372,84 @@ def validate_graph(case: dict, prompt: dict, seed: int, assets_dir: Path) -> dic
                         reject("inpainting requires a non-empty, non-full alpha mask")
         except (OSError, ValueError) as exc:
             raise CaseFailure("SMOKE_ASSET", f"invalid bundled input image: {source}: {exc}") from exc
-        _, model = linked(apply, "model", "UNETLoader")
+        if family == "unet":
+            _, model = linked(apply, "model", "UNETLoader")
+        else:
+            _, model = linked(apply, "model", "CheckpointLoaderSimple")
+    elif control == "controlnet":
+        cn_id, cn = only("ControlNetApplyAdvanced")
+        cn_inputs = cn["inputs"]
+        # Compare by node id: linked() returns inputs, only() returns the node.
+        pos_id, _ = linked(sampler, "positive", "ControlNetApplyAdvanced", 0)
+        neg_id, _ = linked(sampler, "negative", "ControlNetApplyAdvanced", 1)
+        if pos_id != cn_id or neg_id != cn_id:
+            reject("sampler conditioning must come from the ControlNet node")
+        for key in ("positive", "negative"):
+            _, conditioning = linked(cn_inputs, key, "CLIPTextEncode")
+            if not isinstance(conditioning.get("text"), str) or not conditioning["text"].strip():
+                reject(f"{key} text must be non-empty")
+            # The prompt must still be encoded by this case's own model.
+            if family == "checkpoint":
+                source_id, _ = linked(conditioning, "clip", "CheckpointLoaderSimple", 1)
+                if source_id != ckpt_id:
+                    reject("text encoders must come from the same checkpoint")
+            else:
+                _, clip = linked(conditioning, "clip", "CLIPLoader")
+                if clip.get("device") == "cpu":
+                    reject("text encoder must not be pinned to CPU")
+                clip_name = clip.get("clip_name")
+        _, loader = linked(cn_inputs, "control_net", "ControlNetLoader")
+        control_net_name = loader.get("control_net_name")
+        expected_cn = (case.get("expect_model") or {}).get("controlnet")
+        if not isinstance(expected_cn, str) or not expected_cn:
+            reject("ControlNet cases must declare expect_model.controlnet")
+        if control_net_name != expected_cn:
+            reject(f"requires ControlNet weight {expected_cn}")
+        _, image_node = linked(cn_inputs, "image", "LoadImage")
+        name = image_node.get("image")
+        if name not in case["inputs"]:
+            reject("ControlNet must use a declared bundled input image")
+        source = _contained_path(assets_dir, name, "input asset path")
+        if not source.is_file():
+            reject("bundled ControlNet input is missing")
+        if Image is not None:
+            try:
+                with Image.open(source) as img:
+                    img.load()
+                    if img.format != "PNG":
+                        reject("the bundled input must be PNG")
+            except (OSError, ValueError) as exc:
+                raise CaseFailure("SMOKE_ASSET", f"invalid bundled input image: {source}: {exc}") from exc
     else:
-        if any(node["class_type"] == LLLITE_NODE for node in prompt.values()):
-            reject("text-to-image cases must use the unpatched checkpoint")
-        _, model = linked(sampler, "model", "UNETLoader")
-    checkpoint = (
-        "anima-turbo-v1.1.safetensors" if case["id"] == "turbo_t2i"
-        else "anima-base-v1.0.safetensors"
-    )
-    if model.get("unet_name") != checkpoint:
-        reject(f"requires checkpoint {checkpoint}")
+        for absent in (LLLITE_NODE, "ControlNetApplyAdvanced"):
+            if any(node["class_type"] == absent for node in prompt.values()):
+                reject(f"an un-controlled case must not include {absent}")
+
+    # ---- declared model filenames must actually be the loaded ones -----
+    expected_model = (case.get("expect_model") or {}).get(family)
+    if not isinstance(expected_model, str) or not expected_model:
+        reject(f"case must declare expect_model.{family}")
+    if model.get(model_field) != expected_model:
+        reject(f"requires checkpoint {expected_model}")
+    checkpoint = expected_model
+
+    # In the unet family the VAE and text encoder are separate files, so the case
+    # must pin them too; otherwise a swapped encoder would still validate.
+    if family == "unet":
+        for field, actual in (("vae", vae_name), ("clip", clip_name)):
+            want = (case.get("expect_model") or {}).get(field)
+            if not isinstance(want, str) or not want:
+                reject(f"case must declare expect_model.{field}")
+            if actual != want:
+                reject(f"requires {field} {want}")
     return {
         "sampler_node_id": sampler_id,
         "output_node_id": output_id,
         "checkpoint": checkpoint,
+        "family": family,
+        "control": control,
+        "control_net": control_net_name,
+        "vae": vae_name,
         "steps": sampler["steps"],
         "cfg": sampler["cfg"],
         "seed": seed,
@@ -748,7 +865,7 @@ def write_report(
         "input_assets": inputs,
         "cases": cases,
         "notes": [
-            "READY requires exactly the four required cases, in order, to pass in this run.",
+            "READY requires every case in the configured suite to pass, in order, in this run.",
             "Seeds contain 64 bits of secrets entropy; cached KSamplers and fixed-seed runs are rejected.",
             "Images must be PNG, no older than their case start, the expected size and not single-color.",
             "Queue checks before submission cannot exclude simultaneous submissions outside this tool.",
@@ -804,6 +921,7 @@ def run_suite(
     verify_model_shas: bool = False,
     require_plugin_node: bool = True,
     _from_prepare: bool = False,
+    expected_case_ids: tuple[str, ...] | None = None,
 ) -> tuple[dict, int]:
     started_at = C.now_epoch()
     C.assert_no_pending_inferences()
@@ -826,6 +944,14 @@ def run_suite(
                 "no inference was submitted and no service was restarted",
             )
         used_seeds = set()
+        # Order is part of the contract: a tampered payload that reorders or
+        # duplicates cases must be rejected before any inference is submitted.
+        if expected_case_ids:
+            if len(cases) == len(expected_case_ids) and tuple(c["id"] for c in cases) != tuple(expected_case_ids):
+                raise CaseFailure(
+                    "SMOKE_CONFIG",
+                    "smoke cases must be submitted in the declared order",
+                )
         for index, case in enumerate(cases):
             seed = compute_seed(base_seed, run_token, index, True)
             if seed in used_seeds:
@@ -867,8 +993,10 @@ def run_suite(
     })
     object_info = CM.http_json(f"{base_url}/object_info", timeout=60.0) or {}
     missing = [n for n in nodes_checked if n not in object_info]
-    if require_plugin_node and "AnimaLLLiteApply_sdscripts" not in object_info:
-        missing.append("AnimaLLLiteApply_sdscripts")
+    if not require_plugin_node:
+        # Explicit escape hatch for operators who accept a missing optional
+        # plugin node; everything else stays a hard requirement.
+        missing = [n for n in missing if n != LLLITE_NODE]
     if missing:
         return early(
             {
@@ -977,9 +1105,12 @@ def run_suite(
         results.append(record)
 
     # ---- verdict & report ----------------------------------------------
-    requested_all = tuple(c["id"] for c in cases) == REQUIRED_CASE_IDS and tuple(
-        r["id"] for r in results if r["status"] == "passed"
-    ) == REQUIRED_CASE_IDS
+    # READY means "the whole configured suite for this profile passed". A subset
+    # run can never be READY, even if every case it did run succeeded: that is
+    # the guarantee a caller relies on before trusting the image.
+    expected = tuple(expected_case_ids) if expected_case_ids else tuple(c["id"] for c in cases)
+    passed_ids = tuple(r["id"] for r in results if r["status"] == "passed")
+    requested_all = bool(expected) and passed_ids == expected
     any_failed = any(r["status"] == "failed" for r in results)
     verdict = "READY" if (overall_ok and requested_all) else ("FAILED" if any_failed else "PARTIAL")
 
@@ -1032,6 +1163,9 @@ def cmd_run(args) -> None:
         C.fail("E_LOCK_NOT_HELD", "Smoke inference requires an actual inherited operation FD, not only a token.",
                exit_code=4)
     cases = load_cases(args.cases_b64)
+    # The full suite defines what "READY" means; a filtered subset must never
+    # be reported as a complete pass.
+    expected_ids = tuple(c["id"] for c in cases)
     if args.cases:
         wanted = {c.strip() for c in args.cases.split(",") if c.strip()}
         cases = [c for c in cases if c["id"] in wanted]
@@ -1063,6 +1197,7 @@ def cmd_run(args) -> None:
         models=models,
         verify_model_shas=args.verify_model_shas,
         require_plugin_node=not args.skip_plugin_node_check,
+        expected_case_ids=expected_ids,
     )
     C.emit(result, exit_code=exit_code)
 

@@ -92,7 +92,7 @@ def test_compute_seed_is_unique_per_case_and_run(remote_agent):
 
 
 def test_build_prompt_replaces_run_seed(remote_agent, repo_root):
-    workflow = repo_root / "workflows" / "api" / "anima_base_t2i.api.json"
+    workflow = repo_root / "workflows" / "anima" / "api" / "anima_base_t2i.api.json"
     original = workflow.read_text(encoding="utf-8")
     prompt = remote_agent.SMOKE.build_prompt(workflow, {"6": {"seed": "$run_seed"}}, 987654)
     assert prompt["6"]["inputs"]["seed"] == 987654
@@ -101,7 +101,7 @@ def test_build_prompt_replaces_run_seed(remote_agent, repo_root):
 
 
 def test_build_prompt_merges_overrides_and_keeps_other_inputs(remote_agent, repo_root):
-    workflow = repo_root / "workflows" / "api" / "anima_base_t2i.api.json"
+    workflow = repo_root / "workflows" / "anima" / "api" / "anima_base_t2i.api.json"
     prompt = remote_agent.SMOKE.build_prompt(workflow, {"6": {"seed": "$run_seed", "steps": 9}}, 5)
     assert prompt["6"]["inputs"]["steps"] == 9
     assert prompt["6"]["inputs"]["cfg"] == 4.0
@@ -109,7 +109,7 @@ def test_build_prompt_merges_overrides_and_keeps_other_inputs(remote_agent, repo
 
 
 def test_build_prompt_missing_node_raises_case_failure(remote_agent, repo_root):
-    workflow = repo_root / "workflows" / "api" / "anima_base_t2i.api.json"
+    workflow = repo_root / "workflows" / "anima" / "api" / "anima_base_t2i.api.json"
     with pytest.raises(remote_agent.SMOKE.CaseFailure) as excinfo:
         remote_agent.SMOKE.build_prompt(workflow, {"9999": {"seed": 1}}, 5)
     assert excinfo.value.reason == "SMOKE_WORKFLOW"
@@ -122,7 +122,7 @@ def test_build_prompt_missing_workflow_raises_case_failure(remote_agent, tmp_pat
 
 
 def test_load_cases_accepts_the_committed_asset(remote_agent, repo_root):
-    doc = yaml.safe_load((repo_root / "assets" / "smoke" / "smoke_cases.yaml").read_text(encoding="utf-8"))
+    doc = yaml.safe_load((repo_root / "assets" / "smoke" / "anima" / "smoke_cases.yaml").read_text(encoding="utf-8"))
     cases = remote_agent.SMOKE.load_cases(b64(doc))
     assert [c["id"] for c in cases] == ["base_t2i", "lllite_lineart", "lllite_inpaint", "turbo_t2i"]
 
@@ -279,16 +279,16 @@ def test_committed_smoke_cases_have_the_four_required_cases(repo_root):
         assert case["overrides"]["6"]["seed"] == "$run_seed"
     # Turbo runs last with the fast 8-step / CFG 1 contract.
     turbo = json.loads(
-        (repo_root / "workflows" / "api" / "anima_turbo_t2i.api.json").read_text(encoding="utf-8")
+        (repo_root / "workflows" / "anima" / "api" / "anima_turbo_t2i.api.json").read_text(encoding="utf-8")
     )
     assert turbo["6"]["inputs"]["steps"] == 8
     assert turbo["6"]["inputs"]["cfg"] == 1.0
     # The two LLLite cases use the plugin node and distinct weights.
     lineart = json.loads(
-        (repo_root / "workflows" / "api" / "anima_base_lllite_lineart.api.json").read_text(encoding="utf-8")
+        (repo_root / "workflows" / "anima" / "api" / "anima_base_lllite_lineart.api.json").read_text(encoding="utf-8")
     )
     inpaint = json.loads(
-        (repo_root / "workflows" / "api" / "anima_base_lllite_inpaint.api.json").read_text(encoding="utf-8")
+        (repo_root / "workflows" / "anima" / "api" / "anima_base_lllite_inpaint.api.json").read_text(encoding="utf-8")
     )
     assert lineart["11"]["class_type"] == "AnimaLLLiteApply_sdscripts"
     assert inpaint["11"]["class_type"] == "AnimaLLLiteApply_sdscripts"

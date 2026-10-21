@@ -22,11 +22,11 @@ def encoded(value):
 
 
 @pytest.fixture()
-def audit(remote_agent, repo_root, tmp_path, monkeypatch):
+def audit(remote_agent, anima_profile, repo_root, tmp_path, monkeypatch):
     workflows = tmp_path / "workflows"
     assets = tmp_path / "assets"
-    shutil.copytree(repo_root / "workflows" / "api", workflows)
-    shutil.copytree(repo_root / "assets" / "smoke", assets)
+    shutil.copytree(repo_root / "workflows" / "anima" / "api", workflows)
+    shutil.copytree(repo_root / "assets" / "smoke" / "anima", assets)
     cases = copy.deepcopy(load_smoke_cases()["cases"])
     nodes = remote_agent.SMOKE.required_nodes_from_workflows(
         workflows, [case["workflow"] for case in cases]
@@ -48,6 +48,9 @@ def run(audit, cases=None, run_id="audit", **kwargs):
         base_url="http://mock.invalid:18188", comfy_dir=audit.agent.comfy_dir,
         instance_id="4242", image_ref="test-image", base_seed=12345,
         unique_seed=True, run_token=7777,
+        # READY is measured against the full declared suite, so a subset run is
+        # never reported READY even when everything it ran passed.
+        expected_case_ids=tuple(c["id"] for c in audit.cases),
     )
     options.update(kwargs)
     return audit.agent.SMOKE.run_suite(**options)
@@ -101,7 +104,7 @@ def test_payload_schema_version_is_checked(audit, version):
 @pytest.mark.parametrize(
     "field,value",
     [
-        ("id", "unknown"), ("id", []), ("unexpected", 1), ("title", []),
+        ("id", ""), ("id", []), ("unexpected", 1), ("title", []),
         ("timeout_minutes", 0), ("timeout_minutes", -1), ("timeout_minutes", True),
         ("timeout_minutes", "15"), ("timeout_minutes", float("nan")),
         ("timeout_minutes", float("inf")), ("timeout_minutes", float("-inf")),

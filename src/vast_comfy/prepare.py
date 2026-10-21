@@ -27,11 +27,12 @@ import yaml
 from . import jobs, locks, remote
 from .config import Config, _UniqueKeySafeLoader
 from .errors import ConfigError, E_JOB_FAILED, E_LOCK_NOT_HELD, E_SMOKE_FAILED, VastComfyError
-from .paths import find_repo_root
+from .paths import find_repo_root, profile_path, resolve_profile, profile_smoke_dir
 from .ssh import SSHRunner
 from .safety import validate_identifier
 
 _ALLOWED_MODEL_DIRS = {
+    "checkpoints",
     "diffusion_models",
     "unet",
     "text_encoders",
@@ -60,7 +61,7 @@ def new_run_id() -> str:
 
 
 def _models_config_path() -> Path:
-    return find_repo_root() / "config" / "models.yaml"
+    return profile_path(resolve_profile(), find_repo_root())
 
 
 def load_models_config() -> dict:
@@ -224,13 +225,14 @@ def build_models_payload(manifest: dict) -> list[dict]:
 
 
 def _smoke_cases_path() -> Path:
-    return find_repo_root() / "assets" / "smoke" / "smoke_cases.yaml"
+    return profile_smoke_dir(resolve_profile(), find_repo_root()) / "smoke_cases.yaml"
 
 
 _SMOKE_CASE_REQUIRED = {"id", "workflow", "timeout_minutes", "overrides", "expect", "inputs"}
-_SMOKE_CASE_ALLOWED = _SMOKE_CASE_REQUIRED | {"title"}
-_SMOKE_CASE_IDS = ["base_t2i", "lllite_lineart", "lllite_inpaint", "turbo_t2i"]
+_SMOKE_CASE_ALLOWED = _SMOKE_CASE_REQUIRED | {"title", "family", "control", "expect_model", "expect_sampler"}
 _MAX_CASE_SEED = (1 << 64) - 1
+_CASE_FAMILIES = ("unet", "checkpoint")
+_CASE_CONTROLS = ("none", "lllite", "lllite_inpaint", "controlnet")
 
 
 def _case_number(value: Any) -> bool:
@@ -311,6 +313,60 @@ def _validate_case_entry(case: Any) -> None:
                     type(value) is int and 0 <= value <= _MAX_CASE_SEED):
                 raise ConfigError("case override seed must be $run_seed or a uint64")
 
+    # A case declares which model family and control path its workflow uses, plus
+    # the exact filenames that must be loaded. This keeps profile-specific model
+    # names out of the code and lets a new profile ship its own suite.
+    family = case.get("family", "unet")
+    if family not in _CASE_FAMILIES:
+        raise ConfigError(f"case family must be one of {_CASE_FAMILIES}")
+    control = case.get("control", "none")
+    if control not in _CASE_CONTROLS:
+        raise ConfigError(f"case control must be one of {_CASE_CONTROLS}")
+    expect_model = case.get("expect_model")
+    if not isinstance(expect_model, dict) or family not in expect_model:
+        raise ConfigError(f"case expect_model must declare {family!r}")
+    if not isinstance(expect_model[family], str) or not expect_model[family]:
+        raise ConfigError(f"case expect_model.{family} must be a filename")
+    for extra in ("lllite", "controlnet"):
+        if extra in expect_model and (not isinstance(expect_model[extra], str) or not expect_model[extra]):
+            raise ConfigError(f"case expect_model.{extra} must be a filename")
+    if control in ("lllite", "lllite_inpaint") and "lllite" not in expect_model:
+        raise ConfigError("LLLite cases must declare expect_model.lllite")
+    if control == "controlnet" and "controlnet" not in expect_model:
+        raise ConfigError("ControlNet cases must declare expect_model.controlnet")
+    sampler = case.get("expect_sampler")
+    if not isinstance(sampler, dict) or set(sampler) != {"steps", "cfg"}:
+        raise ConfigError("case expect_sampler must declare steps and cfg")
+    if not _case_positive_int(sampler["steps"]) or not _case_number(sampler["cfg"]):
+        raise ConfigError("case expect_sampler values must be positive")
+
+
+def required_nodes_for_profile() -> list[str]:
+    """Node classes the active profile's workflows actually use.
+
+    Derived from the shipped workflows instead of a hardcoded list: an SDXL
+    checkpoint case needs ``CheckpointLoaderSimple`` while an Anima case needs
+    ``UNETLoader``/``CLIPLoader``/``VAELoader``, so a fixed list would report a
+    false failure for whichever profile it was not written for.
+    """
+    doc = load_smoke_cases()
+    api_dir = find_repo_root() / "workflows" / resolve_profile() / "api"
+    nodes: set[str] = set()
+    for case in doc["cases"]:
+        path = api_dir / str(case["workflow"])
+        if not path.is_file():
+            raise ConfigError(f"workflow referenced by smoke case not found: {path}")
+        try:
+            prompt = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise ConfigError(f"invalid workflow JSON: {path}: {exc}") from exc
+        if not isinstance(prompt, dict):
+            raise ConfigError(f"workflow must be a JSON object: {path}")
+        for node in prompt.values():
+            if isinstance(node, dict) and isinstance(node.get("class_type"), str):
+                nodes.add(node["class_type"])
+    return sorted(nodes)
+
 
 def load_smoke_cases() -> dict:
     path = _smoke_cases_path()
@@ -326,8 +382,14 @@ def load_smoke_cases() -> dict:
         raise ConfigError("invalid smoke cases schema")
     for case in data["cases"]:
         _validate_case_entry(case)
-    if [case["id"] for case in data["cases"]] != _SMOKE_CASE_IDS:
-        raise ConfigError("the configured suite must contain the four required cases in order")
+    # Case ids belong to the profile, not to the code: a different model family
+    # legitimately ships a different suite. Only uniqueness and order stability
+    # are enforced here.
+    ids = [case["id"] for case in data["cases"]]
+    if len(set(ids)) != len(ids):
+        raise ConfigError("smoke case ids must be unique")
+    if not ids:
+        raise ConfigError("the smoke suite must contain at least one case")
     return data
 
 
@@ -442,9 +504,9 @@ def prepare_existing(
             "--cases-b64",
             b64_json(cases_doc),
             "--workflows-dir",
-            f"{remote.current_link(cfg)}/workflows/api",
+            f"{remote.current_link(cfg)}/workflows/{resolve_profile()}/api",
             "--assets-dir",
-            f"{remote.current_link(cfg)}/assets/smoke",
+            f"{remote.current_link(cfg)}/assets/smoke/{resolve_profile()}",
             "--run-id",
             actual_run_id,
             "--install-timeout-seconds",

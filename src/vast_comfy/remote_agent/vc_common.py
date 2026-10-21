@@ -40,6 +40,7 @@ DOWNLOADS_DIR = RUNTIME_DIR / "downloads"
 ARTIFACTS_DIR = RUNTIME_DIR / "artifacts"
 
 ALLOWED_MODEL_DIRS = {
+    "checkpoints",
     "diffusion_models",
     "unet",
     "text_encoders",

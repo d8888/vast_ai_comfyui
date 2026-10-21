@@ -20,6 +20,8 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
+import yaml
+
 from .config import Config
 from .errors import E_DEPLOY, E_INTERNAL, VastComfyError
 from .logging_setup import get_logger
@@ -53,26 +55,86 @@ def package_files() -> list[tuple[Path, str]]:
                  "vc_comfy.py", "vc_smoke.py", "vc_prepare.py"):
         files.append((agent_dir / name, f"remote/{name}"))
 
-    for sub in ("api", "gui"):
-        workflow_dir = root / "workflows" / sub
-        if not workflow_dir.is_dir():
+    from .paths import resolve_profile
+
+    profile = resolve_profile()
+    profile_root = root / "workflows" / profile
+    smoke_dir = root / "assets" / "smoke" / profile
+    cases_file = smoke_dir / "smoke_cases.yaml"
+    if not cases_file.is_file():
+        raise VastComfyError(
+            code=E_DEPLOY,
+            message=f"Missing smoke cases for profile {profile!r}: {cases_file}",
+            stage="deploy",
+        )
+
+    # The package contents are derived from the profile's own declared case list,
+    # never from a directory scan: a stray file dropped next to the workflows can
+    # therefore never be uploaded.
+    try:
+        cases_doc = yaml.safe_load(cases_file.read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError) as exc:
+        raise VastComfyError(
+            code=E_DEPLOY,
+            message=f"Cannot read smoke cases for profile {profile!r}: {exc}",
+            stage="deploy",
+        ) from exc
+    cases = cases_doc.get("cases") if isinstance(cases_doc, dict) else None
+    if not isinstance(cases, list) or not cases:
+        raise VastComfyError(
+            code=E_DEPLOY,
+            message=f"Smoke cases for profile {profile!r} declare no cases",
+            stage="deploy",
+        )
+
+    api_dir = profile_root / "api"
+    gui_dir = profile_root / "gui"
+    for case in cases:
+        name = case.get("workflow") if isinstance(case, dict) else None
+        if not isinstance(name, str) or "/" in name or "\\" in name or name.startswith("."):
             raise VastComfyError(
                 code=E_DEPLOY,
-                message=f"Missing workflow directory: {workflow_dir}",
+                message=f"Profile {profile!r} declares an unsafe workflow name: {name!r}",
                 stage="deploy",
             )
-        extension = ".api.json" if sub == "api" else ".json"
-        for stem in ("anima_base_t2i", "anima_base_lllite_lineart",
-                     "anima_base_lllite_inpaint", "anima_turbo_t2i"):
-            path = workflow_dir / f"{stem}{extension}"
-            files.append((path, f"workflows/{sub}/{path.name}"))
+        api_path = api_dir / name
+        if not api_path.is_file():
+            raise VastComfyError(
+                code=E_DEPLOY,
+                message=f"Missing api workflow for profile {profile!r}: {api_path}",
+                stage="deploy",
+            )
+        files.append((api_path, f"workflows/{profile}/api/{name}"))
+        # The GUI twin is optional; ship it only when it exists, still by name.
+        gui_name = name[: -len(".api.json")] + ".json" if name.endswith(".api.json") else None
+        if gui_name:
+            gui_path = gui_dir / gui_name
+            if gui_path.is_file():
+                files.append((gui_path, f"workflows/{profile}/gui/{gui_name}"))
 
-    smoke_dir = root / "assets" / "smoke"
-    if not smoke_dir.is_dir():
-        raise VastComfyError(code=E_DEPLOY, message=f"Missing assets directory: {smoke_dir}", stage="deploy")
-    for name in ("README.md", "smoke_cases.yaml",
-                 "vast_comfy_smoke_control.png", "vast_comfy_smoke_inpaint_src.png"):
-        files.append((smoke_dir / name, f"assets/smoke/{name}"))
+    files.append((cases_file, f"assets/smoke/{profile}/smoke_cases.yaml"))
+    readme = smoke_dir / "README.md"
+    if readme.is_file():
+        files.append((readme, f"assets/smoke/{profile}/README.md"))
+    for case in cases:
+        for asset in case.get("inputs") or []:
+            if (not isinstance(asset, str) or "/" in asset or "\\" in asset
+                    or asset.startswith(".") or not asset.lower().endswith(".png")):
+                raise VastComfyError(
+                    code=E_DEPLOY,
+                    message=f"Profile {profile!r} declares an unsafe input asset: {asset!r}",
+                    stage="deploy",
+                )
+            asset_path = smoke_dir / asset
+            if not asset_path.is_file():
+                raise VastComfyError(
+                    code=E_DEPLOY,
+                    message=f"Missing smoke asset for profile {profile!r}: {asset_path}",
+                    stage="deploy",
+                )
+            rel = f"assets/smoke/{profile}/{asset}"
+            if all(existing != rel for _, existing in files):
+                files.append((asset_path, rel))
 
     return files
 

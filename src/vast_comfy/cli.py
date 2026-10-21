@@ -43,16 +43,6 @@ from .vast.rental import (create_instance, image_ref, verify_creation, verify_of
 
 logger = get_logger("cli")
 
-DEFAULT_REQUIRED_NODES = [
-    "AnimaLLLiteApply_sdscripts",
-    "UNETLoader",
-    "CLIPLoader",
-    "VAELoader",
-    "KSampler",
-    "SaveImage",
-    "LoadImage",
-]
-
 
 # ---------------------------------------------------------------------------
 # Context
@@ -72,7 +62,15 @@ class Ctx:
             except yaml.YAMLError as exc:
                 raise UsageError(f"--set value is not valid YAML: {item!r}: {exc}") from exc
             set_overrides[path.strip()] = value
+        # --profile is sugar for --set profile=NAME; the resolved config stays the
+        # single source of truth, and explicit --set profile=X still wins.
+        explicit_profile = getattr(args, "profile", None)
+        if explicit_profile is not None and "profile" not in set_overrides:
+            set_overrides["profile"] = explicit_profile
         self.cfg: Config = load_config(getattr(args, "config", None), set_overrides)
+        # Publish the resolved profile for helpers that run outside a Ctx
+        # (prepare/smoke/remote all resolve paths from it).
+        os.environ["VAST_COMFY_PROFILE"] = str(self.cfg.require("profile"))
         self._client: VastClient | None = None
         self._state: StateStore | None = None
 
@@ -679,7 +677,14 @@ def cmd_comfy_verify_nodes(ctx: Ctx, args) -> dict:
     from . import comfy
 
     runner, session_id = _session_guard(ctx, args.instance, args.session_id)
-    nodes = [n.strip() for n in args.nodes.split(",")] if args.nodes else DEFAULT_REQUIRED_NODES
+    if args.nodes:
+        nodes = [n.strip() for n in args.nodes.split(",") if n.strip()]
+    else:
+        # Derived from the active profile's own workflows: a hardcoded list can
+        # only ever be right for one model family.
+        from .prepare import required_nodes_for_profile
+
+        nodes = required_nodes_for_profile()
     return comfy.verify_nodes(runner, ctx.cfg, session_id, nodes)
 
 
@@ -853,6 +858,8 @@ def _common_parser() -> argparse.ArgumentParser:
     common.add_argument("--config", default=argparse.SUPPRESS, metavar="PATH")
     common.add_argument("--set", dest="set_overrides", action="append", default=argparse.SUPPRESS, metavar="PATH=VALUE")
     common.add_argument("--env-file", dest="env_file", default=argparse.SUPPRESS, metavar="PATH")
+    common.add_argument("--profile", default=argparse.SUPPRESS, metavar="NAME",
+                        help="model profile under config/profiles (default: from config)")
     common.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
     common.add_argument("--log-level", default=argparse.SUPPRESS, choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return common

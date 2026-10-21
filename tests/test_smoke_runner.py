@@ -39,9 +39,9 @@ def workflow_node_names(workflows_dir):
 
 
 @pytest.fixture()
-def smoke_env(remote_agent, repo_root, monkeypatch):
-    workflows_dir = repo_root / "workflows" / "api"
-    assets_dir = repo_root / "assets" / "smoke"
+def smoke_env(remote_agent, anima_profile, repo_root, monkeypatch):
+    workflows_dir = repo_root / "workflows" / "anima" / "api"
+    assets_dir = repo_root / "assets" / "smoke" / "anima"
     cases = load_smoke_cases()["cases"]
     nodes = workflow_node_names(workflows_dir) | {"AnimaLLLiteApply_sdscripts"}
 
@@ -75,6 +75,9 @@ def run_suite(
         session_id="sess-1",
         run_id=run_id,
         cases=cases,
+        # The full suite is what READY is measured against; `cases` may be a
+        # subset selected via --cases.
+        expected_case_ids=tuple(c["id"] for c in env.cases),
         workflows_dir=env.workflows_dir,
         assets_dir=env.assets_dir,
         base_url=BASE_URL,

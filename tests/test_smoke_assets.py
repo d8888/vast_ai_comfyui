@@ -9,7 +9,7 @@ INPAINT = "vast_comfy_smoke_inpaint_src.png"
 
 
 def test_control_asset_is_a_high_contrast_white_lineart_image(repo_root):
-    path = repo_root / "assets" / "smoke" / CONTROL
+    path = repo_root / "assets" / "smoke" / "anima" / CONTROL
     assert path.is_file()
     with Image.open(path) as img:
         img.load()
@@ -28,7 +28,7 @@ def test_control_asset_is_a_high_contrast_white_lineart_image(repo_root):
 
 
 def test_inpaint_asset_has_a_transparent_region_in_the_middle(repo_root):
-    path = repo_root / "assets" / "smoke" / INPAINT
+    path = repo_root / "assets" / "smoke" / "anima" / INPAINT
     assert path.is_file()
     with Image.open(path) as img:
         img.load()
@@ -54,5 +54,5 @@ def test_smoke_assets_are_whitelisted_for_upload():
     from vast_comfy.remote import package_files
 
     rels = {rel for _, rel in package_files()}
-    assert f"assets/smoke/{CONTROL}" in rels
-    assert f"assets/smoke/{INPAINT}" in rels
+    assert f"assets/smoke/anima/{CONTROL}" in rels
+    assert f"assets/smoke/anima/{INPAINT}" in rels

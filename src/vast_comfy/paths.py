@@ -63,9 +63,39 @@ def config_dir(root: Path | None = None) -> Path:
     return (root or find_repo_root()) / "config"
 
 
+def resolve_profile() -> str:
+    """The active profile name.
+
+    The CLI sets ``VAST_COMFY_PROFILE`` from the resolved config (which already
+    applied any ``--profile`` override), so helpers that run outside a ``Ctx``
+    still agree on the same profile without threading it through every call.
+    """
+    env = os.environ.get("VAST_COMFY_PROFILE")
+    if env:
+        return env
+    return "noobai"
+
+
 def workflows_dir(root: Path | None = None) -> Path:
     return (root or find_repo_root()) / "workflows"
 
 
 def assets_dir(root: Path | None = None) -> Path:
     return (root or find_repo_root()) / "assets"
+
+
+def profiles_dir(root: Path | None = None) -> Path:
+    """Directory holding one model/plugin manifest per profile."""
+    return config_dir(root) / "profiles"
+
+
+def profile_path(profile: str, root: Path | None = None) -> Path:
+    return profiles_dir(root) / f"{profile}.yaml"
+
+
+def profile_workflows_dir(profile: str, root: Path | None = None) -> Path:
+    return workflows_dir(root) / profile
+
+
+def profile_smoke_dir(profile: str, root: Path | None = None) -> Path:
+    return assets_dir(root) / "smoke" / profile

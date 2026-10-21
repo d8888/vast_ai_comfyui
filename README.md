@@ -430,8 +430,8 @@ vast-comfy --env-file .env install verify --instance <ID> --session-id <SID>
 
 - 下載由 instance 直接進行（不經你的控制電腦），未完成檔與正式檔分離，校驗通過才轉正。
 - 目標檔已存在且 sha256 相符 → `skipped`；**不符 → `E_INSTALL_HASH_MISMATCH`，不會覆寫**。要換版本請自己先刪掉遠端那個檔案。
-- `dest` 第一層只接受：`diffusion_models`、`unet`、`text_encoders`、`clip`、`vae`、`controlnet`、`loras`、`embeddings`、`clip_vision`、`upscale_models`、`model_patches`、`ipadapter`、`style_models`、`audio_encoders`。
-- **`checkpoints` 不在允許清單**：整包 SDXL checkpoint（單檔含 UNet＋CLIP＋VAE）目前不能用這條路安裝；請改放 `diffusion_models` 等分件目錄，或自行處理。
+- `dest` 第一層接受：`checkpoints`、`diffusion_models`、`unet`、`text_encoders`、`clip`、`vae`、`controlnet`、`loras`、`embeddings`、`clip_vision`、`upscale_models`、`model_patches`、`ipadapter`、`style_models`、`audio_encoders`。
+- **`checkpoints` 可用**：整包 checkpoint（單檔含 UNet＋CLIP＋VAE，例如 NoobAI-XL）放這裡；分件式的模型（Anima 那種）才走 `diffusion_models`＋`text_encoders`＋`vae`。
 - Civitai 來源改成 `type: civitai` 加 `version_id: <數字>`（`https://civitai.com/api/download/models/<version_id>`）；`sha256` 仍要自己填對。
 - 需要登入才能下載的檔案（`auth_env`）在 v1 一律拒絕，避免把 token 送到機器上。
 
@@ -446,20 +446,20 @@ curl -s "https://api.github.com/repos/Fannovel16/comfyui_controlnet_aux/commits?
   | jq -r '.[0].sha'
 ```
 
-**第 2 步：加進 `config/models.yaml` 的 `plugins:`**
+**第 2 步：加進 profile 的 `plugins:`（例如 `config/profiles/noobai.yaml`）**
 
 ```yaml
   - id: comfyui-controlnet-aux
-    purpose: "ControlNet 預處理器（Canny/Depth/OpenPose…）"
+    purpose: "ControlNet 預處理器（Canny/Depth/OpenPose/DWPose…）"
     repo_url: https://github.com/Fannovel16/comfyui_controlnet_aux
     commit: a587a4c1594524c1d2de5cd1a86cd868ff448e1c
-    dest: custom_nodes/comfyui_controlnet_aux
+    dest: custom_nodes/ComfyUI_controlnet_aux
     required_nodes:
-      - AIO_Preprocessor
-      - ControlNetPreprocessorSelector
+      - DWPreprocessor
+    requirements: requirements.txt
 ```
 
-`dest` 只接受 `custom_nodes/<單一層目錄名>`；`commit` 必須是 40 字元 SHA。
+`dest` 只接受 `custom_nodes/<單一層目錄名>`；`commit` 必須是 40 字元 SHA；`requirements` 必須是外掛目錄內的相對 `.txt` 路徑。
 
 **第 3 步：驗設定後安裝**
 
@@ -487,9 +487,10 @@ vast-comfy --env-file .env comfy verify-nodes --instance <ID> --session-id <SID>
 
 **行為與限制（重要）**
 
-- **`install run` 不會執行 `pip install`。** 若外掛需要額外 Python 套件（`comfyui_controlnet_aux` 需要 `opencv-python`、`scikit-image`、`einops`、`numpy` 等），少了套件 ComfyUI 啟動時 import 就會失敗，節點不會出現。這一步目前要你自己處理： SSH 進機器安裝，或用 `jobs start` 在遠端執行安裝指令（例如 `-- pip install -r custom_nodes/<name>/requirements.txt`）。v1 不代管外掛套件。
+- **`requirements:` 會自動安裝。** 外掛若宣告 `requirements: requirements.txt`，`install run` 會讀該檔並 `pip install -r`，但會先濾掉 `torch`、`torchvision`、`torchaudio`、`xformers`、`pytorch` 這些受保護套件，並把機器上現有的 torch 版本釘成 `-c` 約束，避免連帶升級整個 CUDA build。被濾掉的條目會在結果的 `skipped_requirements` 裡列出。
 - 外掛目標已存在但 commit 不符 → `E_INSTALL`；有本機修改 → `E_INSTALL_DIRTY`。**一律不 reset、不覆寫、不自動升版**，請自己解決衝突。
 - `required_nodes` 是給人看的宣告；實際的節點存在性以 `comfy verify-nodes` 的結果為準。
+- `verify-nodes` 省略 `--nodes` 時，**要檢查的節點是從目前 profile 的 workflow 推導出來的**，不是寫死的清單——所以換 profile 會自動跟著換。
 
 ### 工作流
 

@@ -33,7 +33,14 @@ models:
     sha256: a9e13fd61f3193887791c8a0dd07a07202174dc47d5ddaea94ea1344f07c7467
     size_bytes: 2512030408
 
-# ControlNet loading and application are core ComfyUI nodes
-# (ControlNetLoader / ControlNetApplyAdvanced), so this profile needs no
-# custom node packages.
-plugins: []
+plugins:
+  # Pose/edge/depth annotations for ControlNet. DWPose is what makes a real
+  # photograph usable as a pose reference, including hands and fingers.
+  - id: comfyui-controlnet-aux
+    purpose: "Preprocessors for ControlNet: DWPose, OpenPose, Canny, Depth (Fannovel16)"
+    repo_url: https://github.com/Fannovel16/comfyui_controlnet_aux
+    commit: a587a4c1594524c1d2de5cd1a86cd868ff448e1c
+    dest: custom_nodes/ComfyUI_controlnet_aux
+    required_nodes:
+      - DWPreprocessor
+    requirements: requirements.txt
